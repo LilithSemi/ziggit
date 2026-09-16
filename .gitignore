@@ -8,6 +8,6 @@ result-*
 
 # ---> Zig
 .zig-cache/
+zig-pkg/
 zig-out/
 *.o
-

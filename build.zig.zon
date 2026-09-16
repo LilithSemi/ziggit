@@ -1,0 +1,12 @@
+.{
+    .name = .ziggit,
+    .version = "0.16.0",
+    .dependencies = .{
+        .zurl = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#814277f810774128a5e358ab7ef919f3a87710ef",
+            .hash = "zurl-0.1.0-eM4POTpijACogBG2dJqsSTlnRVV7uxCjSMVEcSkeqYVi",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x8767edec81e98229,
+}
