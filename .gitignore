@@ -11,3 +11,4 @@ result-*
 zig-pkg/
 zig-out/
 *.o
+.superpowers/
