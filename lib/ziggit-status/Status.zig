@@ -353,3 +353,201 @@ fn collectWorktree(
         }
     }
 }
+
+const testing = std.testing;
+
+const Fixture = struct {
+    tmp: std.testing.TmpDir,
+    odb_tmp: std.testing.TmpDir,
+    work: std.Io.Dir,
+    odb: Odb,
+
+    fn init(gpa: Allocator, io: std.Io) !Fixture {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer odb_tmp.cleanup();
+        try odb_tmp.dir.createDirPath(io, "objects");
+        const objects = try odb_tmp.dir.openDir(io, "objects", .{ .iterate = true });
+        const odb = try Odb.init(gpa, io, objects, .sha1, .{});
+        return .{ .tmp = tmp, .odb_tmp = odb_tmp, .work = tmp.dir, .odb = odb };
+    }
+
+    fn deinit(fx: *Fixture) void {
+        fx.odb.deinit();
+        fx.odb_tmp.cleanup();
+        fx.tmp.cleanup();
+    }
+};
+
+fn indexEntry(path: []const u8, oid: Oid, mode: FileMode, size: u32) index_mod.Entry {
+    return .{
+        .path = path,
+        .oid = oid,
+        .mode = mode,
+        .stage = .merged,
+        .size = size,
+        .stat = .{
+            .ctime_seconds = 0,
+            .ctime_nanoseconds = 0,
+            .mtime_seconds = 0,
+            .mtime_nanoseconds = 0,
+            .dev = 0,
+            .ino = 0,
+            .uid = 0,
+            .gid = 0,
+        },
+    };
+}
+
+test "a worktree matching both its index and HEAD reports nothing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const oid = try fx.odb.write(.blob, "hello\n", null);
+
+    var tree_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "a.txt", .oid = oid }};
+    const tree: Tree = .{ .entries = &tree_entries };
+    var tree_buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tree_buf);
+    try tree.write(&w);
+    const tree_oid = try fx.odb.write(.tree, w.buffered(), null);
+
+    var entries = [_]index_mod.Entry{indexEntry("a.txt", oid, .blob, 6)};
+    const index: Index = .{ .gpa = gpa, .entries = &entries };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{ .head_tree = tree_oid }, null);
+    defer result.deinit(gpa);
+    try testing.expect(result.isClean());
+}
+
+test "with no HEAD, every index entry is newly added" {
+    // An unborn branch. Git reports `A  file` here too: there is no commit
+    // for the index to match, so everything staged is an addition.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const oid = object_mod.loose.hash(.sha1, .blob, "hello\n");
+
+    var entries = [_]index_mod.Entry{indexEntry("a.txt", oid, .blob, 6)};
+    const index: Index = .{ .gpa = gpa, .entries = &entries };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Staged.added, result.changes[0].staged);
+    try testing.expectEqual(Worktree.unchanged, result.changes[0].worktree);
+}
+
+test "a file gone from the worktree is reported as deleted, not dropped" {
+    // A deleted file is not on disk, so a walk driven from the worktree
+    // alone cannot see it. Driving from the union of the index and the
+    // worktree is what keeps it. Losing it would lose exactly the change a
+    // caller most needs to hear about.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const oid = object_mod.loose.hash(.sha1, .blob, "hello\n");
+    var entries = [_]index_mod.Entry{indexEntry("gone.txt", oid, .blob, 6)};
+    const index: Index = .{ .gpa = gpa, .entries = &entries };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqualStrings("gone.txt", result.changes[0].path);
+    try testing.expectEqual(Worktree.deleted, result.changes[0].worktree);
+    try testing.expect(!result.changes[0].untracked);
+}
+
+test "changed bytes of the same length are still reported as modified" {
+    // Size is the cheap discriminator, so a change that keeps the length is
+    // the case that catches an implementation which stops there.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "world\n" });
+    const stale = object_mod.loose.hash(.sha1, .blob, "hello\n");
+
+    var entries = [_]index_mod.Entry{indexEntry("a.txt", stale, .blob, 6)};
+    const index: Index = .{ .gpa = gpa, .entries = &entries };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.modified, result.changes[0].worktree);
+}
+
+test "a path in neither the index nor HEAD is untracked" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "new.txt", .data = "x\n" });
+    const index: Index = .{ .gpa = gpa, .entries = &.{} };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expect(result.changes[0].untracked);
+    try testing.expectEqualStrings("new.txt", result.changes[0].path);
+}
+
+test "an ignored path is not reported as untracked" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.tmp\n" });
+    try fx.work.writeFile(io, .{ .sub_path = "scratch.tmp", .data = "x\n" });
+
+    var m = ignore_mod.Matcher.init(gpa);
+    defer m.deinit();
+
+    const index: Index = .{ .gpa = gpa, .entries = &.{} };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{ .ignore = &m }, null);
+    defer result.deinit(gpa);
+
+    // `.gitignore` itself is an ordinary untracked file; the `.tmp` is not
+    // reported at all.
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqualStrings(".gitignore", result.changes[0].path);
+}
+
+test "tracked changes sort before untracked ones" {
+    // Git's porcelain order, measured: sorting everything by path alone put
+    // an untracked `d/...` second rather than last.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "aaa-untracked.txt", .data = "x\n" });
+    const oid = object_mod.loose.hash(.sha1, .blob, "hello\n");
+    var entries = [_]index_mod.Entry{indexEntry("zzz-gone.txt", oid, .blob, 6)};
+    const index: Index = .{ .gpa = gpa, .entries = &entries };
+
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 2), result.changes.len);
+    // `zzz` sorts after `aaa` by path, and still comes first because it is
+    // tracked.
+    try testing.expectEqualStrings("zzz-gone.txt", result.changes[0].path);
+    try testing.expectEqualStrings("aaa-untracked.txt", result.changes[1].path);
+}
