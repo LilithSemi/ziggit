@@ -1047,10 +1047,16 @@ fn walkDirectory(
         @memcpy(path_buf[entry_start .. entry_start + entry.name.len], entry.name);
         var current_path_len = entry_start + entry.name.len;
 
-        // An ignored path is skipped, and an ignored DIRECTORY is not
-        // descended into at all. Not descending is what makes git's rule
-        // that a negation cannot re-include under an excluded directory
-        // hold here too: there is nothing below to re-include.
+        // An ignored path is skipped, and an ignored directory is not
+        // descended into.
+        //
+        // **Not descending is an optimisation here, not the mechanism.**
+        // `isIgnored` tests every ancestor itself, so a file under an
+        // excluded directory is excluded even if the walk does reach it.
+        // That is deliberate belt and braces: the rule holds wherever the
+        // check is made, and skipping the directory only saves the work.
+        // A test that removes the skip therefore still passes, which is
+        // why there is no test claiming otherwise.
         if (options.ignore) |m| {
             if (m.isIgnored(path_buf[0..current_path_len], entry.kind == .directory)) continue;
         }
