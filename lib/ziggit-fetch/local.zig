@@ -278,6 +278,18 @@ fn buildSourceListing(gpa: Allocator, source_refs: *Store) Error![]proto.RefLine
         out.deinit(gpa);
     }
 
+    // `HEAD` first, the way a real `upload-pack` advertises it.
+    //
+    // `Store.iterate` walks the `refs/` directory alone, and `HEAD` sits
+    // beside it rather than inside it, so it can never appear in that walk.
+    // Without this, a refspec whose source is `HEAD` matches nothing and
+    // `buildPlan` answers `RefNotFound`. Git serves `git fetch <path> HEAD`
+    // because it runs `upload-pack` even for a local path, and the remote
+    // strategy here gets the same line for free from a server's `ls-refs`,
+    // so only the local path was ever short of it. A Nix source with
+    // nothing pinned asks for exactly this refspec.
+    try appendHeadLine(gpa, source_refs, &out);
+
     while (it.next()) |ref_owned| {
         var ref = ref_owned;
         defer ref.deinit(gpa);
@@ -292,6 +304,52 @@ fn buildSourceListing(gpa: Allocator, source_refs: *Store) Error![]proto.RefLine
     }
 
     return out.toOwnedSlice(gpa);
+}
+
+/// Adds the `HEAD` line a real `upload-pack` advertises, when there is one.
+///
+/// A repository whose `HEAD` names a branch with no commit yet contributes
+/// **no line at all**, which is what git advertises for an unborn HEAD. That
+/// is not an error: a caller asking for `HEAD` there finds nothing, the same
+/// answer git gives.
+///
+/// `symref_target` carries the branch name for a symbolic `HEAD`, matching
+/// the field a server fills in its own advertisement. A detached `HEAD` holds
+/// an id directly and has no target to name.
+fn appendHeadLine(gpa: Allocator, source_refs: *Store, out: *std.ArrayList(proto.RefLine)) Error!void {
+    var head = source_refs.lookup("HEAD", null) catch |err| switch (err) {
+        // No HEAD file at all. Nothing to advertise, and not a fault of this
+        // fetch: the source simply has none.
+        error.RefNotFound => return,
+        else => return err,
+    };
+    defer head.deinit(gpa);
+
+    var symref_target: ?[]u8 = null;
+    errdefer if (symref_target) |t| gpa.free(t);
+
+    const oid: Oid = switch (head.target) {
+        .oid => |o| o,
+        .symbolic => |branch| blk: {
+            // An unborn branch resolves to nothing, and git advertises
+            // nothing for it.
+            const resolved = source_refs.resolve("HEAD", null) catch |err| switch (err) {
+                error.RefNotFound => return,
+                else => return err,
+            };
+            symref_target = try gpa.dupe(u8, branch);
+            break :blk resolved;
+        },
+    };
+
+    const name_owned = try gpa.dupe(u8, "HEAD");
+    errdefer gpa.free(name_owned);
+    try out.append(gpa, .{
+        .oid = oid,
+        .name = name_owned,
+        .peeled = null,
+        .symref_target = symref_target,
+    });
 }
 
 const CopyResult = struct { objects: u32, bytes: u64, shallow_boundary: std.ArrayList(Oid) };
@@ -1431,4 +1489,123 @@ test "fetch still treats a path containing a colon as a local path" {
         error.NotFound,
         fetch(gpa, io, &dest, "./no/such:place", .{ .refspecs = &rs }, null),
     );
+}
+
+test "a local fetch can match a refspec whose source is HEAD" {
+    // `git fetch /path/to/repo HEAD` works, because git runs upload-pack even
+    // for a local path and upload-pack advertises HEAD as a line of its own.
+    // The remote strategy gets that for free from a real server's ls-refs, so
+    // only the local path was affected. A Nix git source with nothing pinned
+    // asks for exactly this refspec.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    const history = try buildSourceHistory(gpa, &source);
+
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    const source_path = try realPathOf(gpa, io, source_tmp.dir);
+    defer gpa.free(source_path);
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+HEAD:refs/remotes/origin/HEAD")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    var result = try fetchLocal(gpa, io, &dest, source_path, .{ .refspecs = &rs }, null);
+    defer result.deinit(gpa);
+
+    const resolved = try dest.refs.resolve("refs/remotes/origin/HEAD", null);
+    try testing.expect(resolved.eql(history.commit_oid));
+}
+
+test "a local source with an unborn HEAD advertises no HEAD line" {
+    // Git advertises no HEAD for a repository with no commit on its branch,
+    // so a HEAD refspec finds nothing rather than erroring on a broken ref.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    // No buildSourceHistory: HEAD points at a branch that does not exist yet.
+
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    const source_path = try realPathOf(gpa, io, source_tmp.dir);
+    defer gpa.free(source_path);
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+HEAD:refs/remotes/origin/HEAD")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    try testing.expectError(
+        error.RefNotFound,
+        fetchLocal(gpa, io, &dest, source_path, .{ .refspecs = &rs }, null),
+    );
+}
+
+test "a local source with a detached HEAD advertises a plain id line" {
+    // Realistic, not synthetic: `git checkout v1.2.3` and `git worktree add`
+    // at a tag both leave a detached HEAD, and a Nix source pointed at that
+    // directory is an ordinary thing. A server advertises such a HEAD as an
+    // id with no symref target, so this does the same.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    const history = try buildSourceHistory(gpa, &source);
+
+    // Detach HEAD onto the commit, through the ref lock like any other write.
+    try source.refs.setHeadDetached(history.commit_oid, null, null);
+
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    const source_path = try realPathOf(gpa, io, source_tmp.dir);
+    defer gpa.free(source_path);
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+HEAD:refs/remotes/origin/HEAD")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    var result = try fetchLocal(gpa, io, &dest, source_path, .{ .refspecs = &rs }, null);
+    defer result.deinit(gpa);
+
+    const resolved = try dest.refs.resolve("refs/remotes/origin/HEAD", null);
+    try testing.expect(resolved.eql(history.commit_oid));
+}
+
+test "the HEAD line a local source advertises names the branch it points at" {
+    // `symref_target` is the field a real `ls-refs` fills with
+    // `refs/heads/<branch>`. A symbolic HEAD carries it; the detached case
+    // above carries none. Checked on the listing itself rather than through a
+    // fetch, because nothing downstream reads it yet and an unread field is
+    // exactly the kind that quietly stops being filled.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    _ = try buildSourceHistory(gpa, &source);
+
+    const listing = try buildSourceListing(gpa, &source.refs);
+    defer {
+        for (listing) |*r| {
+            var mutable = r.*;
+            mutable.deinit(gpa);
+        }
+        gpa.free(listing);
+    }
+
+    // First, the way a real upload-pack advertises it.
+    try testing.expectEqualStrings("HEAD", listing[0].name);
+    try testing.expectEqualStrings("refs/heads/main", listing[0].symref_target.?);
 }
