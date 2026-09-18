@@ -18,6 +18,7 @@ const core_mod = @import("ziggit-core");
 const FileMode = core_mod.FileMode;
 
 const odb_mod = @import("ziggit-odb");
+const ignore_mod = @import("ziggit-ignore");
 const Odb = odb_mod.Odb;
 
 /// Which side of a conflict an entry belongs to. `merged` is the normal,
@@ -973,7 +974,21 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
 ///
 /// Paths in the index use `/` separators and are relative to the worktree
 /// root.
-pub fn stageWorktree(gpa: Allocator, io: std.Io, work_tree: std.Io.Dir, odb: *Odb, f: Format) Error!Index {
+pub const StageOptions = struct {
+    /// Honour gitignore rules while walking, or null to stage everything.
+    ///
+    /// **The walk mutates this and restores it.** As it enters a directory
+    /// it adds that directory's own `.gitignore`, and drops it again on the
+    /// way out, so a sibling never inherits a rule that was never meant for
+    /// it. The matcher is left holding exactly the sources it arrived with.
+    ///
+    /// A caller supplies whatever lower-precedence sources it wants first,
+    /// the global excludes file and `.git/info/exclude`, in that order.
+    /// This adds only the `.gitignore` files it meets in the tree.
+    ignore: ?*ignore_mod.Matcher = null,
+};
+
+pub fn stageWorktree(gpa: Allocator, io: std.Io, work_tree: std.Io.Dir, odb: *Odb, f: Format, options: StageOptions) Error!Index {
     var entries: std.ArrayList(Entry) = .empty;
     errdefer {
         for (entries.items) |*e| e.deinit(gpa);
@@ -981,7 +996,7 @@ pub fn stageWorktree(gpa: Allocator, io: std.Io, work_tree: std.Io.Dir, odb: *Od
     }
 
     var path_buf: [1024]u8 = undefined;
-    try walkDirectory(gpa, io, work_tree, work_tree, odb, f, &entries, &path_buf, 0);
+    try walkDirectory(gpa, io, work_tree, work_tree, odb, f, &entries, &path_buf, 0, options);
 
     // Sort entries by path.
     std.mem.sort(Entry, entries.items, {}, struct {
@@ -1003,7 +1018,22 @@ fn walkDirectory(
     entries: *std.ArrayList(Entry),
     path_buf: *[1024]u8,
     path_len: usize,
+    options: StageOptions,
 ) Error!void {
+    // This directory's own `.gitignore`, if it has one, outranks everything
+    // above it and is dropped again before the caller moves to a sibling.
+    var restore_to: usize = 0;
+    if (options.ignore) |m| {
+        restore_to = m.sourceCount();
+        const base = path_buf[0..path_len];
+        const trimmed = if (base.len > 0 and base[base.len - 1] == '/') base[0 .. base.len - 1] else base;
+        m.addFile(io, current, ".gitignore", trimmed) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.IoFailed => return error.IoFailed,
+        };
+    }
+    defer if (options.ignore) |m| m.truncate(restore_to);
+
     var iterator = current.iterate();
 
     while (iterator.next(io) catch return error.IoFailed) |entry| {
@@ -1017,6 +1047,14 @@ fn walkDirectory(
         @memcpy(path_buf[entry_start .. entry_start + entry.name.len], entry.name);
         var current_path_len = entry_start + entry.name.len;
 
+        // An ignored path is skipped, and an ignored DIRECTORY is not
+        // descended into at all. Not descending is what makes git's rule
+        // that a negation cannot re-include under an excluded directory
+        // hold here too: there is nothing below to re-include.
+        if (options.ignore) |m| {
+            if (m.isIgnored(path_buf[0..current_path_len], entry.kind == .directory)) continue;
+        }
+
         switch (entry.kind) {
             .directory => {
                 // Recurse into subdirectory
@@ -1025,7 +1063,7 @@ fn walkDirectory(
 
                 var subdir = current.openDir(io, entry.name, .{ .iterate = true }) catch return error.IoFailed;
                 defer subdir.close(io);
-                try walkDirectory(gpa, io, root, subdir, odb, f, entries, path_buf, current_path_len);
+                try walkDirectory(gpa, io, root, subdir, odb, f, entries, path_buf, current_path_len, options);
             },
             .file => {
                 // Get file stat for mtime, ctime, ino, size
@@ -1318,7 +1356,7 @@ test "staging a worktree and writing its tree matches real git" {
     var odb = try stagingOdb(gpa, io, odb_tmp.dir);
     defer odb.deinit();
 
-    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{});
     defer index.deinit();
 
     const root = try tree_builder(gpa, &odb, index, null);
@@ -1350,7 +1388,7 @@ test "a repository directory inside the worktree is not staged" {
     var odb = try stagingOdb(gpa, io, odb_tmp.dir);
     defer odb.deinit();
 
-    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{});
     defer index.deinit();
 
     for (index.entries) |e| {
@@ -1381,7 +1419,7 @@ test "a file named git~1 is staged" {
     var odb = try stagingOdb(gpa, io, odb_tmp.dir);
     defer odb.deinit();
 
-    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{});
     defer index.deinit();
 
     var found = false;
@@ -1406,7 +1444,7 @@ test "a staged entry records the stat fields std.Io exposes and zeroes the rest"
     var odb = try stagingOdb(gpa, io, odb_tmp.dir);
     defer odb.deinit();
 
-    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{});
     defer index.deinit();
 
     const e = index.find("a.txt").?;
@@ -1419,4 +1457,110 @@ test "a staged entry records the stat fields std.Io exposes and zeroes the rest"
     try std.testing.expectEqual(@as(u32, 0), e.stat.dev);
     try std.testing.expectEqual(@as(u32, 0), e.stat.uid);
     try std.testing.expectEqual(@as(u32, 0), e.stat.gid);
+}
+
+test "staging honours no ignore rules unless asked" {
+    // The documented default, and the behaviour a fixture builder relies on.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.log", .data = "x\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{});
+    defer index.deinit();
+
+    try std.testing.expect(index.find("f.log") != null);
+}
+
+test "staging skips an ignored file when a matcher is given" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.log", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "y\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var m = ignore_mod.Matcher.init(gpa);
+    defer m.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{ .ignore = &m });
+    defer index.deinit();
+
+    try std.testing.expect(index.find("f.log") == null);
+    try std.testing.expect(index.find("keep.txt") != null);
+    // The `.gitignore` itself is an ordinary tracked file to git.
+    try std.testing.expect(index.find(".gitignore") != null);
+}
+
+test "staging does not descend into an ignored directory" {
+    // Not descending is what makes git's re-inclusion rule hold: with the
+    // directory skipped there is nothing underneath to re-include, so the
+    // negation below can never take effect.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "build/\n!build/keep.txt\n" });
+    try tmp.dir.createDirPath(io, "build");
+    try tmp.dir.writeFile(io, .{ .sub_path = "build/out.o", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "build/keep.txt", .data = "y\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var m = ignore_mod.Matcher.init(gpa);
+    defer m.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{ .ignore = &m });
+    defer index.deinit();
+
+    try std.testing.expect(index.find("build/out.o") == null);
+    try std.testing.expect(index.find("build/keep.txt") == null);
+}
+
+test "a nested gitignore applies inside its own directory and nowhere else" {
+    // The walk adds each directory's `.gitignore` on the way in and drops it
+    // on the way out. Without the drop, `sub`'s rule would follow the walk
+    // into `other` and ignore a file nothing ever mentioned.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sub");
+    try tmp.dir.createDirPath(io, "other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/.gitignore", .data = "hide.txt\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/hide.txt", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other/hide.txt", .data = "y\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var m = ignore_mod.Matcher.init(gpa);
+    defer m.deinit();
+    const before = m.sourceCount();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1, .{ .ignore = &m });
+    defer index.deinit();
+
+    try std.testing.expect(index.find("sub/hide.txt") == null);
+    try std.testing.expect(index.find("other/hide.txt") != null);
+    // The matcher is left exactly as it arrived.
+    try std.testing.expectEqual(before, m.sourceCount());
 }

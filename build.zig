@@ -113,6 +113,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ziggit-oid", .module = oid },
             .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-ignore", .module = ignore },
         },
     });
     addModuleTests(b, test_step, index);

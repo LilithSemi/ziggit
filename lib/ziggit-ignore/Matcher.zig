@@ -129,6 +129,25 @@ pub const Matcher = struct {
         try m.addText(text, base);
     }
 
+    /// How many sources are loaded. Paired with `truncate`, this is how a
+    /// walk adds a directory's own `.gitignore` on the way in and drops it
+    /// on the way out, so a sibling directory never inherits it.
+    pub fn sourceCount(m: *const Matcher) usize {
+        return m.sources.items.len;
+    }
+
+    /// Drops every source added after `count`. A `count` at or above the
+    /// current number does nothing, so an unbalanced restore cannot remove
+    /// a source it did not add.
+    pub fn truncate(m: *Matcher, count: usize) void {
+        while (m.sources.items.len > count) {
+            const s = m.sources.pop().?;
+            for (s.patterns) |p| m.gpa.free(p.text);
+            m.gpa.free(s.patterns);
+            m.gpa.free(s.base);
+        }
+    }
+
     /// Whether git would leave `path` untracked. `path` is relative to the
     /// worktree root and uses `/` separators.
     ///
