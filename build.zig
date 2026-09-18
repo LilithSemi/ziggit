@@ -34,6 +34,16 @@ pub fn build(b: *std.Build) void {
     });
     addModuleTests(b, test_step, pktline);
 
+    // gitignore matching. Imports nothing, for the same reason
+    // `ziggit-pktline` does: pattern text and relative paths are the whole
+    // input, and the rules are published and testable against real git.
+    const ignore = b.addModule("ziggit-ignore", .{
+        .root_source_file = b.path("lib/ziggit-ignore.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addModuleTests(b, test_step, ignore);
+
     // The shared vocabulary of every layer above: object kinds, file modes,
     // authorship identity, the diagnostic channel, and ref name validation.
     // It holds no I/O.
@@ -333,6 +343,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-revwalk", revwalk);
     ziggit.addImport("ziggit-fetch", fetch);
     ziggit.addImport("ziggit-submodule", submodule);
+    ziggit.addImport("ziggit-ignore", ignore);
     addModuleTests(b, test_step, ziggit);
 
     // The plumbing CLI: the one place in this project allowed to print,

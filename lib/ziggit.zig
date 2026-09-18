@@ -85,6 +85,12 @@ pub const RefOutcome = @import("ziggit-fetch").RefOutcome;
 pub const UrlKind = @import("ziggit-fetch").UrlKind;
 pub const classifyUrl = @import("ziggit-fetch").classifyUrl;
 
+// gitignore matching. A caller adds sources lowest precedence first: the
+// global excludes file, then `.git/info/exclude`, then each `.gitignore`
+// from the worktree root downwards. Nothing in the type can check that
+// order, so it is the caller's to keep.
+pub const IgnoreMatcher = @import("ziggit-ignore").Matcher;
+
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;
 pub const updateAll = @import("ziggit-submodule").updateAll;

@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -127,6 +127,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         try lsTree(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "rev-parse")) {
         try revParseCmd(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "check-ignore")) {
+        try checkIgnore(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "show-ref")) {
         try showRef(gpa, &repo, rest, stdout, stderr);
     } else {
@@ -662,4 +664,74 @@ fn initCmd(
         return err;
     };
     try stdout.print("Initialized empty Git repository in {s}/.git/\n", .{path_buf[0..len]});
+}
+
+/// `ziggit check-ignore <path>...`, matching `git check-ignore`: prints each
+/// path that would be ignored, one per line, and exits 0 when at least one
+/// was, 1 when none were.
+///
+/// Sources are added lowest precedence first, which is the order
+/// `ziggit.IgnoreMatcher` documents: `core.excludesFile`, then
+/// `.git/info/exclude`, then every `.gitignore` from the worktree root down
+/// to each path's own directory.
+fn checkIgnore(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    if (args.len == 0) {
+        try stderr.writeAll("usage: ziggit check-ignore <path>...\n");
+        return error.UsageError;
+    }
+
+    const worktree = repo.layout.work_tree orelse {
+        try stderr.writeAll("ziggit: check-ignore needs a working tree\n");
+        return error.UsageError;
+    };
+
+    var any = false;
+    for (args) |path| {
+        var m = ziggit.IgnoreMatcher.init(gpa);
+        defer m.deinit();
+
+        if (repo.config.getString("core.excludesFile")) |global| {
+            // An absolute path, so it is opened from the filesystem root
+            // rather than from the repository.
+            if (std.mem.lastIndexOfScalar(u8, global, '/')) |slash| {
+                var dir = std.Io.Dir.cwd().openDir(io, global[0..slash], .{}) catch null;
+                if (dir) |*d| {
+                    defer d.close(io);
+                    try m.addFile(io, d.*, global[slash + 1 ..], "");
+                }
+            }
+        }
+        try m.addFile(io, repo.layout.common_dir, "info/exclude", "");
+
+        // Every `.gitignore` from the root down to the path's own directory,
+        // shallowest first, because a deeper file must win.
+        try m.addFile(io, worktree, ".gitignore", "");
+        var at: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, path, at, '/')) |slash| {
+            const base = path[0..slash];
+            const nested = try std.fmt.allocPrint(gpa, "{s}/.gitignore", .{base});
+            defer gpa.free(nested);
+            try m.addFile(io, worktree, nested, base);
+            at = slash + 1;
+        }
+
+        const is_dir = blk: {
+            const stat = worktree.statFile(io, path, .{}) catch break :blk false;
+            break :blk stat.kind == .directory;
+        };
+
+        if (m.isIgnored(path, is_dir)) {
+            try stdout.print("{s}\n", .{path});
+            any = true;
+        }
+    }
+
+    if (!any) return error.NoneIgnored;
 }
