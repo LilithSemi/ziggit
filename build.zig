@@ -203,6 +203,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ziggit-core", .module = core },
             .{ .name = "ziggit-object", .module = object },
             .{ .name = "ziggit-pack", .module = pack },
+            .{ .name = "ziggit-index", .module = index },
         },
     });
     addModuleTests(b, test_step, odb);

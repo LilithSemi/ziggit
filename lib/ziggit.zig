@@ -55,6 +55,8 @@ pub const isTransient = @import("ziggit-transport").isTransient;
 // to name it.
 pub const TransportOptions = @import("ziggit-transport").Options;
 
+pub const writeTreeFromIndex = @import("ziggit-odb").writeTreeFromIndex;
+
 pub const checkoutTree = @import("ziggit-checkout").checkoutTree;
 pub const Strategy = @import("ziggit-checkout").Strategy;
 
