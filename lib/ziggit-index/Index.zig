@@ -20,12 +20,24 @@ const FileMode = core_mod.FileMode;
 /// copies git keeps while a conflict is unresolved.
 pub const Stage = enum(u2) { merged = 0, base = 1, ours = 2, theirs = 3 };
 
+pub const Stat = struct {
+    ctime_seconds: u32,
+    ctime_nanoseconds: u32,
+    mtime_seconds: u32,
+    mtime_nanoseconds: u32,
+    dev: u32,
+    ino: u32,
+    uid: u32,
+    gid: u32,
+};
+
 pub const Entry = struct {
     path: []const u8, // owned
     oid: Oid,
     mode: FileMode,
     stage: Stage,
     size: u32,
+    stat: Stat,
 
     pub fn deinit(e: *Entry, gpa: Allocator) void {
         gpa.free(e.path);
@@ -210,18 +222,31 @@ fn readEntry(gpa: Allocator, r: *std.Io.Reader, f: Format, version: u32) Error!E
     // path (direct length or NUL-scan) was taken.
     var consumed: u64 = 0;
 
-    // ctime (seconds, nanoseconds), mtime (seconds, nanoseconds): not part
-    // of `Entry`, read past and discarded.
-    _ = r.take(16) catch |e| return mapRead(e);
-    consumed += 16;
-    // dev, ino: not part of `Entry`.
-    _ = r.take(8) catch |e| return mapRead(e);
-    consumed += 8;
+    // ctime (seconds, nanoseconds), mtime (seconds, nanoseconds).
+    const ctime_seconds = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+    const ctime_nanoseconds = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+    const mtime_seconds = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+    const mtime_nanoseconds = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+
+    // dev, ino.
+    const dev = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+    const ino = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+
     const mode_raw = r.takeInt(u32, .big) catch |e| return mapRead(e);
     consumed += 4;
-    // uid, gid: not part of `Entry`.
-    _ = r.take(8) catch |e| return mapRead(e);
-    consumed += 8;
+
+    // uid, gid.
+    const uid = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+    const gid = r.takeInt(u32, .big) catch |e| return mapRead(e);
+    consumed += 4;
+
     const size = r.takeInt(u32, .big) catch |e| return mapRead(e);
     consumed += 4;
 
@@ -276,7 +301,23 @@ fn readEntry(gpa: Allocator, r: *std.Io.Reader, f: Format, version: u32) Error!E
         r.discardAll(pad_len) catch |e| return mapRead(e);
     }
 
-    return .{ .path = path, .oid = oid, .mode = mode, .stage = stage, .size = size };
+    return .{
+        .path = path,
+        .oid = oid,
+        .mode = mode,
+        .stage = stage,
+        .size = size,
+        .stat = .{
+            .ctime_seconds = ctime_seconds,
+            .ctime_nanoseconds = ctime_nanoseconds,
+            .mtime_seconds = mtime_seconds,
+            .mtime_nanoseconds = mtime_nanoseconds,
+            .dev = dev,
+            .ino = ino,
+            .uid = uid,
+            .gid = gid,
+        },
+    };
 }
 
 /// Consumes whatever comes after the entry table: zero or more extensions,
@@ -707,4 +748,58 @@ test "a genuine read fault is IoFailed, not CorruptIndex" {
 
     const result = Index.open(gpa, failing_io, tmp.dir, .sha1);
     try std.testing.expectError(error.IoFailed, result);
+}
+
+test "an index entry keeps the stat block the file holds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const hex_str = "4449524300000002000000036aad5ec90d7d910b6aad5ec90d7d910b00000022000c6585000081a4000003e80000006400000006ce013625030ba8dba906f756967f9e9ca394464a0005612e74787400000000006aad5ec90d7d910b6aad5ec90d7d910b00000022000c678c000081a4000003e8000000640000000779c53955ef856f16f2107446bc721c8879a1bd2e0007642f622e7478740000006aad5ec90e1628156aad5ec90d7d910b00000022000c678f000081ed000003e8000000640000000a1a2485251c33a70432394c93fb89330ef214bfc9000672756e2e7368000000005452454500000033003320310adc388fc74b7ae653cebc33b4d91de4fc84b1339464003120300abd6bc799012984c0083beb6c9448d3ea68c214cf0a49b6e8159a806c61df2a7bd4bdddabf6e61c8f";
+    var bytes: [307]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_str);
+
+    var idx = try openFromBytes(gpa, tmp.dir, io, &bytes);
+    defer idx.deinit();
+
+    const atxt = idx.entries[0];
+    try std.testing.expectEqual(@as(u32, 0x6aad5ec9), atxt.stat.ctime_seconds);
+    try std.testing.expectEqual(@as(u32, 0x0d7d910b), atxt.stat.ctime_nanoseconds);
+    try std.testing.expectEqual(@as(u32, 0x6aad5ec9), atxt.stat.mtime_seconds);
+    try std.testing.expectEqual(@as(u32, 0x0d7d910b), atxt.stat.mtime_nanoseconds);
+    try std.testing.expectEqual(@as(u32, 34), atxt.stat.dev);
+    try std.testing.expectEqual(@as(u32, 812421), atxt.stat.ino);
+    try std.testing.expectEqual(@as(u32, 1000), atxt.stat.uid);
+    try std.testing.expectEqual(@as(u32, 100), atxt.stat.gid);
+
+    const runsh = idx.entries[2];
+    try std.testing.expectEqual(@as(u32, 0x6aad5ec9), runsh.stat.ctime_seconds);
+    try std.testing.expectEqual(@as(u32, 0x0e162815), runsh.stat.ctime_nanoseconds);
+    try std.testing.expectEqual(@as(u32, 0x6aad5ec9), runsh.stat.mtime_seconds);
+    try std.testing.expectEqual(@as(u32, 0x0d7d910b), runsh.stat.mtime_nanoseconds);
+    try std.testing.expectEqual(@as(u32, 34), runsh.stat.dev);
+    try std.testing.expectEqual(@as(u32, 812943), runsh.stat.ino);
+    try std.testing.expectEqual(@as(u32, 1000), runsh.stat.uid);
+    try std.testing.expectEqual(@as(u32, 100), runsh.stat.gid);
+}
+
+test "reading an index still reports the right path, mode, size and oid" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var idx = try openFromBytes(gpa, tmp.dir, io, &vector_v2);
+    defer idx.deinit();
+
+    const atxt = idx.entries[0];
+    try std.testing.expectEqualStrings("alpha.txt", atxt.path);
+    try std.testing.expectEqual(FileMode.blob, atxt.mode);
+    try std.testing.expectEqual(@as(u32, 6), atxt.size);
+
+    const runsh = idx.entries[2];
+    try std.testing.expectEqualStrings("run.sh", runsh.path);
+    try std.testing.expectEqual(FileMode.blob_executable, runsh.mode);
+    try std.testing.expectEqual(@as(u32, 18), runsh.size);
 }
