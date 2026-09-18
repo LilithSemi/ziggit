@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const oid_mod = @import("ziggit-oid");
 const Format = oid_mod.Format;
 const Oid = oid_mod.Oid;
+const Hasher = oid_mod.Hasher;
 
 const core_mod = @import("ziggit-core");
 const FileMode = core_mod.FileMode;
@@ -802,4 +803,293 @@ test "reading an index still reports the right path, mode, size and oid" {
     try std.testing.expectEqualStrings("run.sh", runsh.path);
     try std.testing.expectEqual(FileMode.blob_executable, runsh.mode);
     try std.testing.expectEqual(@as(u32, 18), runsh.size);
+}
+
+// Index writer
+
+/// Writes an index to `.git/index` via a lock file. Version 2 only. Entries
+/// are sorted by path bytes with stage as tiebreaker. Extended flag bits
+/// are never set on v2 entries. No extensions are written. A Format decides
+/// the object id length and the trailing checksum.
+pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
+    var aw: std.Io.Writer.Allocating = .init(i.gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    w.writeAll(Index.signature) catch return error.IoFailed;
+    w.writeInt(u32, 2, .big) catch return error.IoFailed; // version 2 only
+    w.writeInt(u32, @intCast(i.entries.len), .big) catch return error.IoFailed;
+
+    // Sort entries by path, then by stage.
+    const sorted = try i.gpa.dupe(Entry, i.entries);
+    defer i.gpa.free(sorted);
+    std.mem.sort(Entry, sorted, {}, struct {
+        fn lessThan(_: void, lhs: Entry, rhs: Entry) bool {
+            const cmp = std.mem.order(u8, lhs.path, rhs.path);
+            if (cmp == .eq) {
+                return @intFromEnum(lhs.stage) < @intFromEnum(rhs.stage);
+            }
+            return cmp == .lt;
+        }
+    }.lessThan);
+
+    // Write each entry.
+    for (sorted) |entry| {
+        w.writeInt(u32, entry.stat.ctime_seconds, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.ctime_nanoseconds, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.mtime_seconds, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.mtime_nanoseconds, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.dev, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.ino, .big) catch return error.IoFailed;
+        w.writeInt(u32, @intFromEnum(entry.mode), .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.uid, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.stat.gid, .big) catch return error.IoFailed;
+        w.writeInt(u32, entry.size, .big) catch return error.IoFailed;
+
+        const oid_len = f.byteLength();
+        const oid_bytes_ptr = switch (f) {
+            .sha1 => &entry.oid.sha1,
+            .sha256 => &entry.oid.sha256,
+        };
+        w.writeAll(oid_bytes_ptr[0..oid_len]) catch return error.IoFailed;
+
+        // Flags: stage bits (12-13), name length bits (0-11).
+        const stage_bits: u16 = @intCast(@intFromEnum(entry.stage));
+        const name_len = entry.path.len;
+        const name_len_field: u16 = if (name_len >= Index.name_len_overflow)
+            Index.name_len_overflow
+        else
+            @intCast(name_len);
+        const flags = (stage_bits << Index.stage_shift) | name_len_field;
+        w.writeInt(u16, flags, .big) catch return error.IoFailed;
+
+        // Write path NUL-terminated.
+        w.writeAll(entry.path) catch return error.IoFailed;
+        w.writeByte(0) catch return error.IoFailed;
+
+        // Padding to 8-byte boundary.
+        const consumed: u64 = 40 + oid_len + 2 + entry.path.len + 1;
+        const padded = std.mem.alignForward(u64, consumed, 8);
+        const pad = padded - consumed;
+        if (pad > 0) {
+            const pad_bytes: [7]u8 = [_]u8{0} ** 7;
+            w.writeAll(pad_bytes[0..pad]) catch return error.IoFailed;
+        }
+    }
+
+    const content = try aw.toOwnedSlice();
+    defer i.gpa.free(content);
+
+    // Compute checksum.
+    var hasher = Hasher.init(f);
+    hasher.update(content);
+    const checksum = hasher.final();
+    const checksum_bytes_ptr = switch (f) {
+        .sha1 => &checksum.sha1,
+        .sha256 => &checksum.sha256,
+    };
+    const checksum_len = f.byteLength();
+
+    // Write through lock file and rename.
+    var lock_file = git_dir.createFile(io, "index.lock", .{ .truncate = true }) catch return error.IoFailed;
+    defer lock_file.close(io);
+
+    var write_buffer: [8192]u8 = undefined;
+    var file_writer = lock_file.writer(io, &write_buffer);
+    const fw = &file_writer.interface;
+    fw.writeAll(content) catch return error.IoFailed;
+    fw.writeAll(checksum_bytes_ptr[0..checksum_len]) catch return error.IoFailed;
+    file_writer.flush() catch return error.IoFailed;
+
+    // Atomically rename lock to index.
+    git_dir.rename("index.lock", git_dir, "index", io) catch {
+        // Clean up the lock file if rename fails.
+        git_dir.deleteFile(io, "index.lock") catch {};
+        return error.IoFailed;
+    };
+}
+
+// Tests for write
+
+test "the index writer produces the bytes real git produces" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Decode INDEX_NOEXT_HEX: 248 bytes, no extensions.
+    const hex_str = "4449524300000002000000036aad61ac0704332f6aad61ac0704332f00000022000c2b5f000081a4000003e80000006400000006ce013625030ba8dba906f756967f9e9ca394464a0005612e74787400000000006aad61ac079cca546aad61ac079cca5400000022000c4a4e000081a4000003e8000000640000000779c53955ef856f16f2107446bc721c8879a1bd2e0007642f622e7478740000006aad61ac079cca546aad61ac079cca5400000022000c4a50000081ed000003e8000000640000000a1a2485251c33a70432394c93fb89330ef214bfc9000672756e2e73680000000080b071ddea14076c1c019c8e72fe82e8e1701f26";
+    var expected: [248]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, hex_str);
+
+    var idx = try openFromBytes(gpa, tmp.dir, io, &expected);
+    defer idx.deinit();
+
+    try write(idx, io, tmp.dir, .sha1);
+
+    var file = tmp.dir.openFile(io, "index", .{}) catch return error.TestUnexpectedError;
+    defer file.close(io);
+    var read_buffer: [256]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    reader.seekTo(0) catch return error.TestUnexpectedError;
+    const r = &reader.interface;
+
+    const written = r.take(248) catch return error.TestUnexpectedError;
+
+    try std.testing.expectEqualSlices(u8, &expected, written);
+}
+
+test "a read and a write round trip preserves an entry's stat block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const hex_str = "4449524300000002000000036aad61ac0704332f6aad61ac0704332f00000022000c2b5f000081a4000003e80000006400000006ce013625030ba8dba906f756967f9e9ca394464a0005612e74787400000000006aad61ac079cca546aad61ac079cca5400000022000c4a4e000081a4000003e8000000640000000779c53955ef856f16f2107446bc721c8879a1bd2e0007642f622e7478740000006aad61ac079cca546aad61ac079cca5400000022000c4a50000081ed000003e8000000640000000a1a2485251c33a70432394c93fb89330ef214bfc9000672756e2e73680000000080b071ddea14076c1c019c8e72fe82e8e1701f26";
+    var bytes: [248]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_str);
+
+    var idx1 = try openFromBytes(gpa, tmp.dir, io, &bytes);
+    defer idx1.deinit();
+
+    const stat1 = idx1.entries[0].stat;
+
+    try write(idx1, io, tmp.dir, .sha1);
+
+    var idx2 = try Index.open(gpa, io, tmp.dir, .sha1);
+    defer idx2.deinit();
+
+    const stat2 = idx2.entries[0].stat;
+
+    try std.testing.expectEqual(stat1.ctime_seconds, stat2.ctime_seconds);
+    try std.testing.expectEqual(stat1.ctime_nanoseconds, stat2.ctime_nanoseconds);
+    try std.testing.expectEqual(stat1.mtime_seconds, stat2.mtime_seconds);
+    try std.testing.expectEqual(stat1.mtime_nanoseconds, stat2.mtime_nanoseconds);
+    try std.testing.expectEqual(stat1.dev, stat2.dev);
+    try std.testing.expectEqual(stat1.ino, stat2.ino);
+    try std.testing.expectEqual(stat1.uid, stat2.uid);
+    try std.testing.expectEqual(stat1.gid, stat2.gid);
+}
+
+test "entries handed out of order are sorted on write" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Build an index with entries in the wrong order.
+    var entries: [3]Entry = undefined;
+
+    entries[0] = .{
+        .path = try gpa.dupe(u8, "run.sh"),
+        .oid = Oid.fromBytes(.sha1, &[_]u8{
+            0x1a, 0x24, 0x85, 0x25, 0x1c, 0x33, 0xa7, 0x04, 0x32, 0x39,
+            0x4c, 0x93, 0xfb, 0x89, 0x33, 0x0e, 0xf2, 0x14, 0xbf, 0xc9,
+        }),
+        .mode = FileMode.blob_executable,
+        .stage = Stage.merged,
+        .size = 10,
+        .stat = .{
+            .ctime_seconds = 0x6aad61ac,
+            .ctime_nanoseconds = 0x079cca54,
+            .mtime_seconds = 0x6aad61ac,
+            .mtime_nanoseconds = 0x079cca54,
+            .dev = 34,
+            .ino = 805456,
+            .uid = 1000,
+            .gid = 100,
+        },
+    };
+
+    entries[1] = .{
+        .path = try gpa.dupe(u8, "a.txt"),
+        .oid = Oid.fromBytes(.sha1, &[_]u8{
+            0xce, 0x01, 0x36, 0x25, 0x03, 0x0b, 0xa8, 0xdb, 0xa9, 0x06,
+            0xf7, 0x56, 0x96, 0x7f, 0x9e, 0x9c, 0xa3, 0x94, 0x46, 0x4a,
+        }),
+        .mode = FileMode.blob,
+        .stage = Stage.merged,
+        .size = 6,
+        .stat = .{
+            .ctime_seconds = 0x6aad61ac,
+            .ctime_nanoseconds = 0x0704332f,
+            .mtime_seconds = 0x6aad61ac,
+            .mtime_nanoseconds = 0x0704332f,
+            .dev = 34,
+            .ino = 797535,
+            .uid = 1000,
+            .gid = 100,
+        },
+    };
+
+    entries[2] = .{
+        .path = try gpa.dupe(u8, "d/b.txt"),
+        .oid = Oid.fromBytes(.sha1, &[_]u8{
+            0x79, 0xc5, 0x39, 0x55, 0xef, 0x85, 0x6f, 0x16, 0xf2, 0x10,
+            0x74, 0x46, 0xbc, 0x72, 0x1c, 0x88, 0x79, 0xa1, 0xbd, 0x2e,
+        }),
+        .mode = FileMode.blob,
+        .stage = Stage.merged,
+        .size = 7,
+        .stat = .{
+            .ctime_seconds = 0x6aad61ac,
+            .ctime_nanoseconds = 0x079cca54,
+            .mtime_seconds = 0x6aad61ac,
+            .mtime_nanoseconds = 0x079cca54,
+            .dev = 34,
+            .ino = 805454,
+            .uid = 1000,
+            .gid = 100,
+        },
+    };
+
+    const idx: Index = .{
+        .gpa = gpa,
+        .entries = &entries,
+    };
+
+    try write(idx, io, tmp.dir, .sha1);
+
+    var read_idx = try Index.open(gpa, io, tmp.dir, .sha1);
+    defer read_idx.deinit();
+
+    try std.testing.expectEqualStrings("a.txt", read_idx.entries[0].path);
+    try std.testing.expectEqualStrings("d/b.txt", read_idx.entries[1].path);
+    try std.testing.expectEqualStrings("run.sh", read_idx.entries[2].path);
+
+    for (&entries) |entry| {
+        gpa.free(entry.path);
+    }
+}
+
+test "the index is written through a lock file and none is left behind" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Plant a stale lock file with recognisable bytes.
+    const lock_bytes = "STALE_LOCK_MARKER_1234567890"[0..28];
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.lock", .data = lock_bytes });
+
+    const hex_str = "4449524300000002000000036aad61ac0704332f6aad61ac0704332f00000022000c2b5f000081a4000003e80000006400000006ce013625030ba8dba906f756967f9e9ca394464a0005612e74787400000000006aad61ac079cca546aad61ac079cca5400000022000c4a4e000081a4000003e8000000640000000779c53955ef856f16f2107446bc721c8879a1bd2e0007642f622e7478740000006aad61ac079cca546aad61ac079cca5400000022000c4a50000081ed000003e8000000640000000a1a2485251c33a70432394c93fb89330ef214bfc9000672756e2e73680000000080b071ddea14076c1c019c8e72fe82e8e1701f26";
+    var bytes: [248]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, hex_str);
+
+    var idx = try openFromBytes(gpa, tmp.dir, io, &bytes);
+    defer idx.deinit();
+
+    try write(idx, io, tmp.dir, .sha1);
+
+    var file = tmp.dir.openFile(io, "index", .{}) catch return error.TestUnexpectedError;
+    defer file.close(io);
+    var read_buffer: [256]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    reader.seekTo(0) catch return error.TestUnexpectedError;
+    const r = &reader.interface;
+
+    const index_content = r.take(248) catch return error.TestUnexpectedError;
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "index.lock", .{}));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, index_content, 1, lock_bytes));
 }
