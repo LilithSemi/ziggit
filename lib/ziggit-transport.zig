@@ -30,6 +30,9 @@ pub const Http = http_mod.Http;
 
 const ssh_mod = @import("ziggit-transport/ssh.zig");
 pub const Ssh = ssh_mod.Ssh;
+
+const git_mod = @import("ziggit-transport/git.zig");
+pub const Git = git_mod.Git;
 /// True for git's scp-like remote spelling, `user@host:path`. Exported so
 /// `ziggit-fetch` can route that spelling to the ssh transport instead of
 /// opening it as a directory, without writing a second rule for it.
@@ -41,4 +44,5 @@ test {
     _ = credentials_mod;
     _ = http_mod;
     _ = ssh_mod;
+    _ = git_mod;
 }

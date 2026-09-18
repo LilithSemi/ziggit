@@ -36,6 +36,7 @@ const proto = @import("ziggit-proto");
 const transport_mod = @import("ziggit-transport");
 const Http = transport_mod.Http;
 const Ssh = transport_mod.Ssh;
+const Git = transport_mod.Git;
 
 const fetcher_mod = @import("Fetcher.zig");
 const FetchOptions = fetcher_mod.FetchOptions;
@@ -150,11 +151,18 @@ pub fn fetch(
             opts.remote_url = url;
             break :blk fetcher_mod.fetchRemote(gpa, io, repo, ssh.transport(), opts, diag);
         },
+        .git_daemon => blk: {
+            var daemon = try Git.open(gpa, io, url);
+            defer daemon.deinit();
+            var opts = options;
+            opts.remote_url = url;
+            break :blk fetcher_mod.fetchRemote(gpa, io, repo, daemon.transport(), opts, diag);
+        },
         .unknown => error.UnsupportedProtocol,
     };
 }
 
-const UrlKind = union(enum) {
+pub const UrlKind = union(enum) {
     /// The filesystem path this fetch should open: `url` itself for a
     /// bare path with no scheme, or the text after `file://` for a
     /// `file://` url. Borrowed from `url`.
@@ -162,10 +170,13 @@ const UrlKind = union(enum) {
     http,
     https,
     ssh,
+    /// The git daemon protocol, `git://`, on a plain TCP connection.
+    /// Anonymous and unencrypted, with no credential and no host key.
+    git_daemon,
     unknown,
 };
 
-fn classifyUrl(url: []const u8) UrlKind {
+pub fn classifyUrl(url: []const u8) UrlKind {
     const separator = "://";
     if (std.mem.indexOf(u8, url, separator)) |at| {
         const scheme = url[0..at];
@@ -174,6 +185,7 @@ fn classifyUrl(url: []const u8) UrlKind {
         if (std.mem.eql(u8, scheme, "http")) return .http;
         if (std.mem.eql(u8, scheme, "https")) return .https;
         if (std.mem.eql(u8, scheme, "ssh")) return .ssh;
+        if (std.mem.eql(u8, scheme, "git")) return .git_daemon;
         return .unknown;
     }
     // `user@host:path` is the commonest way an ssh remote is written.
@@ -1387,7 +1399,32 @@ test "fetch refuses an unrecognised url scheme rather than guessing at it" {
     defer for (&rs) |*r| r.deinit(gpa);
     try testing.expectError(
         error.UnsupportedProtocol,
-        fetch(gpa, io, &dest, "git://example.com/repo.git", .{ .refspecs = &rs }, null),
+        fetch(gpa, io, &dest, "ftp://example.com/repo.git", .{ .refspecs = &rs }, null),
+    );
+}
+
+test "fetch sends a git:// url to the daemon transport" {
+    // `git://` used to be this project's example of an unsupported scheme,
+    // which is why the test above now names `ftp`.
+    //
+    // The url below is deliberately malformed: it names a host and no
+    // repository path. Only the daemon branch can answer `ProtocolError`
+    // for it, because only that branch parses it as a url; the local
+    // branch would read the whole thing as a path and answer `NotFound`.
+    // So this pins the routing without resolving a name or opening a
+    // socket.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    try testing.expectError(
+        error.ProtocolError,
+        fetch(gpa, io, &dest, "git://example.com", .{ .refspecs = &rs }, null),
     );
 }
 

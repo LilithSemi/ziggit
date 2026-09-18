@@ -46,6 +46,10 @@ pub const IndexStage = @import("ziggit-index").Stage;
 pub const Transport = @import("ziggit-transport").Transport;
 pub const Http = @import("ziggit-transport").Http;
 pub const Ssh = @import("ziggit-transport").Ssh;
+// The git daemon protocol, `git://`. Anonymous and unencrypted: it takes
+// no credential and checks no host key, so `Options.credentials` is never
+// consulted for it.
+pub const Git = @import("ziggit-transport").Git;
 pub const Credential = @import("ziggit-transport").Credential;
 pub const CredentialCallback = @import("ziggit-transport").CredentialCallback;
 pub const AllowedTypes = @import("ziggit-transport").AllowedTypes;
@@ -74,6 +78,12 @@ pub const Refspec = @import("ziggit-fetch").Refspec;
 pub const Result = @import("ziggit-fetch").Result;
 pub const UpdatedRef = @import("ziggit-fetch").UpdatedRef;
 pub const RefOutcome = @import("ziggit-fetch").RefOutcome;
+// How a url names a repository: a path, or one of the three network
+// transports. Exported so a consumer, and this project's own CLI, pick a
+// transport by the same rule `fetch` uses rather than by a second copy of
+// it that drifts out of date.
+pub const UrlKind = @import("ziggit-fetch").UrlKind;
+pub const classifyUrl = @import("ziggit-fetch").classifyUrl;
 
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;

@@ -330,7 +330,13 @@ pub const Ssh = struct {
         s.state.reader.interface.end = 0;
 
         var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
-        return proto.parseCapabilities(gpa, &s.state.reader.interface, &buf) catch |err| {
+        var remote_message: ?[]u8 = null;
+        defer if (remote_message) |m| gpa.free(m);
+        return proto.parseCapabilities(gpa, &s.state.reader.interface, &buf, &remote_message) catch |err| {
+            if (err == error.RemoteRefused) {
+                recordMessage(gpa, diag, remote_message orelse "the ssh server refused the request");
+                return error.NotFound;
+            }
             // `UnsupportedProtocol` here almost always means the server
             // refused the `GIT_PROTOCOL` env request and answered wire
             // protocol v0, which this build does not implement. Name that,
@@ -340,7 +346,10 @@ pub const Ssh = struct {
                 else => "reading the ssh capability advertisement failed",
             };
             recordMessage(gpa, diag, msg);
-            return err;
+            return switch (err) {
+                error.RemoteRefused => unreachable, // handled above
+                else => |e| e,
+            };
         };
     }
 

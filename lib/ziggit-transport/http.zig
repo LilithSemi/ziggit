@@ -167,7 +167,18 @@ fn capabilitiesImpl(ctx: *anyopaque, gpa: Allocator, diag: ?*?Diagnostic) Error!
 
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
     try skipServiceHeader(gpa, resp.body, &buf, "git-upload-pack", diag);
-    return proto.parseCapabilities(gpa, resp.body, &buf);
+    var remote_message: ?[]u8 = null;
+    defer if (remote_message) |m| gpa.free(m);
+    return proto.parseCapabilities(gpa, resp.body, &buf, &remote_message) catch |err| switch (err) {
+        // The server answered an `ERR` line rather than an advertisement.
+        // Its own text names the reason, which is worth far more than the
+        // parse fault that used to be reported in its place.
+        error.RemoteRefused => {
+            recordMessage(gpa, diag, remote_message orelse "the server refused the request");
+            return error.NotFound;
+        },
+        else => |e| return e,
+    };
 }
 
 fn commandImpl(ctx: *anyopaque, gpa: Allocator, cmd: Command, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {

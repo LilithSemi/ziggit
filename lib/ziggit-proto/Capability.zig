@@ -58,6 +58,12 @@ pub const Capabilities = struct {
 
 pub const ParseError = error{ ProtocolError, UnsupportedProtocol } || Allocator.Error;
 
+/// `parseCapabilities` alone can answer `RemoteRefused`, so it carries its
+/// own set. Putting it in `ParseError` widened every other reader in this
+/// module with an error none of them can produce, which a caller then has
+/// to handle or explicitly rule out for no reason.
+pub const CapabilityError = ParseError || error{RemoteRefused};
+
 /// Reads one capability advertisement from `r`: the leading `version 2`
 /// line, then every `key[=value]` line up to the flush pkt-line that ends
 /// it.
@@ -66,7 +72,12 @@ pub const ParseError = error{ ProtocolError, UnsupportedProtocol } || Allocator.
 /// this module speaks v2 only, and a v1 or v0 server is refused rather than
 /// downgraded to. An `object-format` value this module does not implement
 /// is the same error, never a silent guess at sha1.
-pub fn parseCapabilities(gpa: Allocator, r: *std.Io.Reader, buf: []u8) ParseError!Capabilities {
+/// `remote_message` receives the server's own text when it answers with an
+/// `ERR` line, and is left alone otherwise. The caller owns what lands
+/// there and must free it. It is an out-parameter rather than a
+/// `Diagnostic` because this module deliberately imports no error
+/// taxonomy; each transport decides how to report what it is handed.
+pub fn parseCapabilities(gpa: Allocator, r: *std.Io.Reader, buf: []u8, remote_message: *?[]u8) CapabilityError!Capabilities {
     var entries: std.ArrayList(Capability) = .empty;
     errdefer {
         freeEntries(gpa, entries.items);
@@ -74,6 +85,23 @@ pub fn parseCapabilities(gpa: Allocator, r: *std.Io.Reader, buf: []u8) ParseErro
     }
 
     const first_line = try readLine(r, buf);
+
+    // A server that refuses the request answers with one `ERR <message>`
+    // pkt-line instead of an advertisement, and the message is the whole
+    // point of it: the git daemon says "access denied or repository not
+    // exported" for a repository that is not there, and git prints that
+    // text as "remote error: ...".
+    //
+    // Without this, every such refusal parses as "the first line is not
+    // `version 2`" and is reported as `UnsupportedProtocol`, which tells a
+    // reader their server is too old when the truth is they named a
+    // repository that does not exist. All three transports shared that
+    // fault, because all three land here.
+    if (std.mem.startsWith(u8, first_line, "ERR ")) {
+        remote_message.* = try gpa.dupe(u8, first_line["ERR ".len..]);
+        return error.RemoteRefused;
+    }
+
     if (!std.mem.eql(u8, first_line, "version 2")) return error.UnsupportedProtocol;
     try entries.append(gpa, .{
         .key = try gpa.dupe(u8, "version"),
@@ -168,8 +196,10 @@ test "parseCapabilities reads version 2 and the agent string" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed(advertisement_vector);
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
 
-    var caps = try parseCapabilities(gpa, &r, &buf);
+    var caps = try parseCapabilities(gpa, &r, &buf, &msg);
     defer caps.deinit(gpa);
 
     try std.testing.expect(caps.isV2());
@@ -184,8 +214,10 @@ test "parseCapabilities reads object-format sha256" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed(advertisement_sha256_vector);
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
 
-    var caps = try parseCapabilities(gpa, &r, &buf);
+    var caps = try parseCapabilities(gpa, &r, &buf, &msg);
     defer caps.deinit(gpa);
 
     try std.testing.expectEqual(Format.sha256, caps.objectFormat());
@@ -199,8 +231,10 @@ test "objectFormat defaults to sha1 when the server does not say" {
     // real server sends, only what a bare-minimum one is allowed to.
     var r: std.Io.Reader = .fixed("000eversion 2\n0000");
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
 
-    var caps = try parseCapabilities(gpa, &r, &buf);
+    var caps = try parseCapabilities(gpa, &r, &buf, &msg);
     defer caps.deinit(gpa);
 
     try std.testing.expectEqual(Format.sha1, caps.objectFormat());
@@ -212,14 +246,18 @@ test "parseCapabilities refuses a server that advertises only version 1" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("000eversion 1\n0000");
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
 
-    try std.testing.expectError(error.UnsupportedProtocol, parseCapabilities(gpa, &r, &buf));
+    try std.testing.expectError(error.UnsupportedProtocol, parseCapabilities(gpa, &r, &buf, &msg));
 }
 
 test "parseCapabilities refuses an object-format we do not implement" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("000eversion 2\n001bobject-format=sha3-256\n0000");
     var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
 
-    try std.testing.expectError(error.UnsupportedProtocol, parseCapabilities(gpa, &r, &buf));
+    try std.testing.expectError(error.UnsupportedProtocol, parseCapabilities(gpa, &r, &buf, &msg));
 }

@@ -952,7 +952,9 @@ const FakeTransport = struct {
         const bytes = aw.written();
         var r: std.Io.Reader = .fixed(bytes);
         var pkt_buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
-        return proto.parseCapabilities(gpa, &r, &pkt_buf) catch return error.ProtocolError;
+        var remote_message: ?[]u8 = null;
+        defer if (remote_message) |m| gpa.free(m);
+        return proto.parseCapabilities(gpa, &r, &pkt_buf, &remote_message) catch return error.ProtocolError;
     }
 
     fn commandImpl(

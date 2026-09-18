@@ -23,6 +23,8 @@ pub const fetchRemote = fetcher_mod.fetchRemote;
 const local_mod = @import("ziggit-fetch/local.zig");
 pub const Error = local_mod.Error;
 pub const fetchLocal = local_mod.fetchLocal;
+pub const UrlKind = local_mod.UrlKind;
+pub const classifyUrl = local_mod.classifyUrl;
 pub const fetch = local_mod.fetch;
 
 test {

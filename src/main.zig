@@ -438,32 +438,16 @@ fn lsRemote(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std
 
 /// A url with no `scheme://` prefix, or an explicit `file://` one, names a
 /// path on this filesystem. Anything else names a scheme this CLI dials
-/// out over. Mirrors `ziggit-fetch`'s own url classification, which is
-/// not part of the front package's surface: a CLI subcommand deciding how
-/// to dial a url is exactly the kind of policy the library leaves to its
-/// caller.
-const UrlKind = union(enum) {
-    local: []const u8,
-    http,
-    https,
-    ssh,
-    unknown,
-};
-
-fn classifyUrl(url: []const u8) UrlKind {
-    const separator = "://";
-    const at = std.mem.indexOf(u8, url, separator) orelse return .{ .local = url };
-    const scheme = url[0..at];
-    const rest = url[at + separator.len ..];
-    if (std.mem.eql(u8, scheme, "file")) return .{ .local = rest };
-    if (std.mem.eql(u8, scheme, "http")) return .http;
-    if (std.mem.eql(u8, scheme, "https")) return .https;
-    if (std.mem.eql(u8, scheme, "ssh")) return .ssh;
-    return .unknown;
-}
-
+/// out over.
+///
+/// This uses `ziggit.classifyUrl`, the same rule `fetch` uses. It had its
+/// own copy until that copy fell two fixes behind: it knew nothing of
+/// `git://`, and nothing of git's scp-like `user@host:path` spelling, so
+/// the CLI opened an ssh remote as a directory and reported a missing
+/// repository. A second copy of a rule is how a fix reaches one caller and
+/// not the other.
 fn remoteRefs(gpa: Allocator, io: std.Io, url: []const u8, diag: *?Diagnostic) ![]RemoteRef {
-    return switch (classifyUrl(url)) {
+    return switch (ziggit.classifyUrl(url)) {
         .local => |path| localRefs(gpa, io, path, diag),
         .http, .https => blk: {
             var http = try ziggit.Http.open(gpa, io, url, .{});
@@ -477,6 +461,11 @@ fn remoteRefs(gpa: Allocator, io: std.Io, url: []const u8, diag: *?Diagnostic) !
         // mean silently trusting, or silently refusing, every host key
         // alike.
         .ssh => error.SshVerifierRequired,
+        .git_daemon => blk: {
+            var daemon = try ziggit.Git.open(gpa, io, url);
+            defer daemon.deinit();
+            break :blk transportRefs(gpa, daemon.transport(), diag);
+        },
         .unknown => error.UnsupportedProtocol,
     };
 }

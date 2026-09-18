@@ -9,6 +9,7 @@ const capability_mod = @import("ziggit-proto/Capability.zig");
 pub const Capability = capability_mod.Capability;
 pub const Capabilities = capability_mod.Capabilities;
 pub const ParseError = capability_mod.ParseError;
+pub const CapabilityError = capability_mod.CapabilityError;
 pub const parseCapabilities = capability_mod.parseCapabilities;
 
 const ls_refs_mod = @import("ziggit-proto/ls_refs.zig");
