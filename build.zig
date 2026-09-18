@@ -94,9 +94,8 @@ pub fn build(b: *std.Build) void {
 
     // Reads `.git/index`, git's staged snapshot of the working tree.
     // Versions 2 and 3 only; version 4's prefix-compressed path names are a
-    // different parser and are refused. Read only: a consumer needs this
-    // to see what a dirty working tree looks like, and writing an index
-    // back out belongs to a later task.
+    // different parser and are refused. Read and write: a consumer can
+    // read an existing index, or build one by staging a worktree.
     const index = b.addModule("ziggit-index", .{
         .root_source_file = b.path("lib/ziggit-index.zig"),
         .target = target,
@@ -222,9 +221,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ziggit-core", .module = core },
             .{ .name = "ziggit-object", .module = object },
             .{ .name = "ziggit-odb", .module = odb },
+            .{ .name = "ziggit-index", .module = index },
         },
     });
     addModuleTests(b, test_step, checkout);
+
+    // The index module needs the odb to stage a worktree, but odb is defined
+    // after index in this file, so add this import after odb exists.
+    index.addImport("ziggit-odb", odb);
 
     // The top of the core: repository discovery, the on-disk layout, and
     // the `Repository` that ties the object database, the ref store, and

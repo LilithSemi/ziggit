@@ -167,7 +167,7 @@ fn updateAtDepth(
 
         const sub_tree_oid = try readCommitTree(gpa, &sub_repo.odb, sub_repo.format, gitlink_oid, diag);
 
-        try checkout_mod.checkoutTree(gpa, io, &sub_repo.odb, sub_dir, sub_tree_oid, options.strategy, diag);
+        try checkout_mod.checkoutTree(gpa, io, &sub_repo.odb, sub_dir, sub_dir, sub_tree_oid, options.strategy, diag);
 
         if (options.recursive) {
             try updateAtDepth(gpa, io, &sub_repo, sub_dir, sub_tree_oid, options, diag, depth + 1);

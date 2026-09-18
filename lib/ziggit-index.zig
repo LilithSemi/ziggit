@@ -7,6 +7,7 @@ pub const Entry = index_mod.Entry;
 pub const Error = index_mod.Error;
 pub const Index = index_mod.Index;
 pub const write = index_mod.write;
+pub const stageWorktree = index_mod.stageWorktree;
 
 test {
     _ = index_mod;

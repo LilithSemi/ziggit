@@ -33,6 +33,7 @@ pub const DiscoverOptions = @import("ziggit-repo").DiscoverOptions;
 // `Index` (the `.idx` file's own type), and this package flattens every
 // module's surface into one namespace, so the two cannot share a name.
 pub const WorktreeIndex = @import("ziggit-index").Index;
+pub const stageWorktree = @import("ziggit-index").stageWorktree;
 pub const writeWorktreeIndex = @import("ziggit-index").write;
 // `WorktreeIndex.find` returns `?IndexEntry`, and its `entries` field is
 // `[]const IndexEntry`; renamed here for the same reason as

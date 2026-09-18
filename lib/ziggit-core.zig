@@ -32,6 +32,9 @@ pub const refname = refname_mod.refname;
 const dir_mod = @import("ziggit-core/dir.zig");
 pub const openDirRelative = dir_mod.openDirRelative;
 
+const entry_name_mod = @import("ziggit-core/entry_name.zig");
+pub const isDotGitName = entry_name_mod.isDotGitName;
+
 test {
     _ = object_kind_mod;
     _ = file_mode_mod;
@@ -41,4 +44,5 @@ test {
     _ = diagnostic_mod;
     _ = refname_mod;
     _ = dir_mod;
+    _ = entry_name_mod;
 }

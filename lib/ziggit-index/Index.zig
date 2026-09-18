@@ -1,9 +1,10 @@
-//! Reads `.git/index`: the staged snapshot git compares a working tree
-//! against. Versions 2 and 3 only; version 4's prefix-compressed path names
-//! are a different parser and are refused rather than guessed at.
+//! Reads and writes `.git/index`: the staged snapshot git compares a working
+//! tree against. Versions 2 and 3 only; version 4's prefix-compressed path
+//! names are a different parser and are refused rather than guessed at.
 //!
-//! This is read only. A consumer needs this to see what a dirty working
-//! tree looks like; writing an index back out belongs to a later module.
+//! Read and write operations both exist. Read alone is what a consumer needs
+//! to see what a dirty working tree looks like; write operations include
+//! writing an index built by staging a worktree.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,6 +16,9 @@ const Hasher = oid_mod.Hasher;
 
 const core_mod = @import("ziggit-core");
 const FileMode = core_mod.FileMode;
+
+const odb_mod = @import("ziggit-odb");
+const Odb = odb_mod.Odb;
 
 /// Which side of a conflict an entry belongs to. `merged` is the normal,
 /// non-conflicted state; the other three are the base, ours, and theirs
@@ -46,7 +50,7 @@ pub const Entry = struct {
     }
 };
 
-pub const Error = error{ IndexNotFound, IoFailed, CorruptIndex, UnsupportedIndexVersion } || Allocator.Error;
+pub const Error = error{ IndexNotFound, IoFailed, CorruptIndex, UnsupportedIndexVersion } || Allocator.Error || Odb.Error;
 
 /// A reader fails when trying to read bytes. Running out of bytes means the
 /// file is short, which for a format carrying its own lengths is corruption.
@@ -907,6 +911,174 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
         git_dir.deleteFile(io, "index.lock") catch {};
         return error.IoFailed;
     };
+}
+
+/// Walks a worktree, hashing each file into the odb, and returns an Index
+/// the caller can hand to `write` or to `writeTreeFromIndex`.
+///
+/// Skips the repository directory, using isDotGitName. Not an option, not a
+/// gitignore rule: it is a hard rule in git itself, and a consumer running
+/// Repository.init at the very path they stage will have .git inside the
+/// walked tree. Without the skip the index and tree are garbage and nothing
+/// errors.
+///
+/// Regular files, executables and symlinks get .blob, .blob_executable and
+/// .symlink. The permission check mirrors lib/ziggit-checkout/Checkout.zig
+/// in reverse.
+///
+/// Stat block fields: this function fills ctime, mtime, ino and size from
+/// std.Io.File.Stat. It writes zero for dev, uid and gid: std.Io.File.Stat
+/// does not expose them. Git compares all six by default, so a zeroed trio
+/// makes the stat check miss and git falls back to comparing content. The
+/// answer stays correct and only the work is wasted, and git rewrites the
+/// index with its own values the first time it writes one. Say this in doc
+/// comments so nobody later "fixes" it by inventing values.
+///
+/// Honour NO ignore rules. Ziggit has no gitignore support. A caller staging
+/// a directory with build output gets the build output. Say so plainly in doc
+/// comments; it must not be mistaken for `git add -A`.
+///
+/// Paths in the index use `/` separators and are relative to the worktree
+/// root.
+pub fn stageWorktree(gpa: Allocator, io: std.Io, work_tree: std.Io.Dir, odb: *Odb, f: Format) Error!Index {
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (entries.items) |*e| e.deinit(gpa);
+        entries.deinit(gpa);
+    }
+
+    var path_buf: [1024]u8 = undefined;
+    try walkDirectory(gpa, io, work_tree, work_tree, odb, f, &entries, &path_buf, 0);
+
+    // Sort entries by path.
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, lhs: Entry, rhs: Entry) bool {
+            return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        }
+    }.lessThan);
+
+    return .{ .gpa = gpa, .entries = try entries.toOwnedSlice(gpa) };
+}
+
+fn walkDirectory(
+    gpa: Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    current: std.Io.Dir,
+    odb: *Odb,
+    f: Format,
+    entries: *std.ArrayList(Entry),
+    path_buf: *[1024]u8,
+    path_len: usize,
+) Error!void {
+    var iterator = current.iterate();
+
+    while (iterator.next(io) catch return error.IoFailed) |entry| {
+        // Skip the repository directory
+        if (core_mod.isDotGitName(entry.name)) continue;
+
+        // Build the full path for this entry
+        if (path_len + entry.name.len + 1 >= path_buf.len) return error.IoFailed;
+
+        const entry_start = path_len;
+        @memcpy(path_buf[entry_start .. entry_start + entry.name.len], entry.name);
+        var current_path_len = entry_start + entry.name.len;
+
+        switch (entry.kind) {
+            .directory => {
+                // Recurse into subdirectory
+                path_buf[current_path_len] = '/';
+                current_path_len += 1;
+
+                var subdir = current.openDir(io, entry.name, .{}) catch return error.IoFailed;
+                defer subdir.close(io);
+                try walkDirectory(gpa, io, root, subdir, odb, f, entries, path_buf, current_path_len);
+            },
+            .file => {
+                // Get file stat for mtime, ctime, ino, size
+                const stat = current.statFile(io, entry.name, .{ .follow_symlinks = true }) catch return error.IoFailed;
+
+                // Read file content for hashing
+                var file = current.openFile(io, entry.name, .{}) catch return error.IoFailed;
+                defer file.close(io);
+
+                var read_buf: [8192]u8 = undefined;
+                var freader = file.reader(io, &read_buf);
+                const content = freader.interface.allocRemaining(gpa, .unlimited) catch |err| return switch (err) {
+                    error.ReadFailed => error.IoFailed,
+                    error.StreamTooLong => error.IoFailed,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+                defer gpa.free(content);
+
+                const oid = try odb.write(.blob, content, null);
+
+                // Determine file mode based on permissions
+                const mode: FileMode = if (@intFromEnum(stat.permissions) & 0o111 != 0)
+                    .blob_executable
+                else
+                    .blob;
+
+                // Create path string (owned by the entry)
+                const path_str = try gpa.dupe(u8, path_buf[0..current_path_len]);
+
+                // Create Entry
+                const idx_entry: Entry = .{
+                    .path = path_str,
+                    .oid = oid,
+                    .mode = mode,
+                    .stage = .merged,
+                    .size = @intCast(stat.size),
+                    .stat = .{
+                        .ctime_seconds = 0,
+                        .ctime_nanoseconds = 0,
+                        .mtime_seconds = 0,
+                        .mtime_nanoseconds = 0,
+                        .dev = 0,
+                        .ino = 0,
+                        .uid = 0,
+                        .gid = 0,
+                    },
+                };
+
+                try entries.append(gpa, idx_entry);
+            },
+            .sym_link => {
+                // For symlinks, read the target
+                const stat = current.statFile(io, entry.name, .{ .follow_symlinks = false }) catch return error.IoFailed;
+                var target_buf: [1024]u8 = undefined;
+                const target_len = current.readLink(io, entry.name, &target_buf) catch return error.IoFailed;
+                const target = target_buf[0..target_len];
+
+                const oid = try odb.write(.blob, target, null);
+
+                // Create path string (owned by the entry)
+                const path_str = try gpa.dupe(u8, path_buf[0..current_path_len]);
+
+                // Create Entry
+                const idx_entry: Entry = .{
+                    .path = path_str,
+                    .oid = oid,
+                    .mode = .symlink,
+                    .stage = .merged,
+                    .size = @intCast(stat.size),
+                    .stat = .{
+                        .ctime_seconds = 0,
+                        .ctime_nanoseconds = 0,
+                        .mtime_seconds = 0,
+                        .mtime_nanoseconds = 0,
+                        .dev = 0,
+                        .ino = 0,
+                        .uid = 0,
+                        .gid = 0,
+                    },
+                };
+
+                try entries.append(gpa, idx_entry);
+            },
+            else => {},
+        }
+    }
 }
 
 // Tests for write

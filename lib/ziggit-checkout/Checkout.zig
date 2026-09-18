@@ -72,6 +72,7 @@ const Allocator = std.mem.Allocator;
 
 const oid_mod = @import("ziggit-oid");
 const Oid = oid_mod.Oid;
+const Format = oid_mod.Format;
 
 const core_mod = @import("ziggit-core");
 const Diagnostic = core_mod.Diagnostic;
@@ -83,19 +84,28 @@ const Tree = object_mod.Tree;
 const odb_mod = @import("ziggit-odb");
 const Odb = odb_mod.Odb;
 
+const index_mod = @import("ziggit-index");
+const Index = index_mod.Index;
+
 pub const Strategy = struct {
     force: bool = false,
     recreate_missing: bool = true,
     remove_untracked: bool = false,
+    write_index: bool = false,
 };
 
-pub const Error = error{ PathEscapesWorktree, NameReservedForCheckout, NameReservedForRepository, NameTooLong, IoFailed } || Odb.Error || Allocator.Error;
+pub const Error = error{ PathEscapesWorktree, NameReservedForCheckout, NameReservedForRepository, NameTooLong, IoFailed } || Odb.Error || Allocator.Error || index_mod.Error;
 
 /// Writes the tree at `tree_oid` into `worktree`.
 ///
-/// This function writes NO index. After a checkout, running `git status` in
-/// the resulting worktree shows every file as untracked. There is no index
-/// writer in ziggit yet; that belongs to a later specification.
+/// When `strategy.write_index` is false (the default), this function writes
+/// no index. After a checkout, running `git status` in the resulting worktree
+/// shows every file as untracked.
+///
+/// When `strategy.write_index` is true, this function builds and writes an
+/// index to `git_dir/index` after checkout completes, recording each file's
+/// oid, mode and stat block. After a checkout with this option, the worktree
+/// and index are in sync: `git status` shows nothing to commit.
 ///
 /// Content filters are NOT applied and there is no option to enable them. A
 /// caller hashes the raw committed blobs, so gitattributes or autocrlf
@@ -105,11 +115,12 @@ pub fn checkoutTree(
     io: std.Io,
     odb: *Odb,
     worktree: std.Io.Dir,
+    git_dir: std.Io.Dir,
     tree_oid: Oid,
     strategy: Strategy,
     diag: ?*?Diagnostic,
 ) Error!void {
-    try checkoutInto(gpa, io, odb, worktree, tree_oid, strategy, diag);
+    try checkoutInto(gpa, io, odb, worktree, git_dir, tree_oid, strategy, diag);
 }
 
 /// Allocation budget for reading one tree object whole. `Odb.readAlloc`
@@ -147,7 +158,8 @@ fn checkoutInto(
     gpa: Allocator,
     io: std.Io,
     odb: *Odb,
-    dir: std.Io.Dir,
+    worktree: std.Io.Dir,
+    git_dir: std.Io.Dir,
     tree_oid: Oid,
     strategy: Strategy,
     diag: ?*?Diagnostic,
@@ -178,14 +190,20 @@ fn checkoutInto(
     for (tree.entries) |entry| {
         try validateEntryName(entry.name);
         switch (entry.mode) {
-            .tree => try checkoutSubtree(gpa, io, odb, dir, entry, strategy, diag),
-            .gitlink => try checkoutGitlink(io, dir, entry, strategy),
-            .blob, .blob_executable => try checkoutBlob(gpa, io, odb, dir, entry, strategy, diag, tmp_name),
-            .symlink => try checkoutSymlink(gpa, io, odb, dir, entry, strategy, diag),
+            .tree => try checkoutSubtree(gpa, io, odb, git_dir, worktree, entry, strategy, diag),
+            .gitlink => try checkoutGitlink(io, worktree, entry, strategy),
+            .blob, .blob_executable => try checkoutBlob(gpa, io, odb, worktree, entry, strategy, diag, tmp_name),
+            .symlink => try checkoutSymlink(gpa, io, odb, worktree, entry, strategy, diag),
         }
     }
 
-    if (strategy.remove_untracked) try removeUntracked(gpa, io, dir, tree);
+    if (strategy.remove_untracked) try removeUntracked(gpa, io, worktree, tree);
+
+    if (strategy.write_index) {
+        var index = try index_mod.stageWorktree(gpa, io, worktree, odb, odb.format);
+        defer index.deinit();
+        try index_mod.write(index, io, git_dir, odb.format);
+    }
 }
 
 /// A path is absolute if it starts with the POSIX root separator `/`, or
@@ -326,7 +344,7 @@ fn validateEntryName(name: []const u8) Error!void {
     const normalised = norm_buf[0..norm_len];
 
     // Reject if normalised form is `.git`.
-    if (std.mem.eql(u8, normalised, ".git")) return error.NameReservedForRepository;
+    if (core_mod.isDotGitName(normalised)) return error.NameReservedForRepository;
 
     // Reject if normalised form is `git~` followed by one or more digits.
     if (normalised.len >= 5 and std.mem.startsWith(u8, normalised, "git~")) {
@@ -473,7 +491,7 @@ fn checkoutSymlink(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry
     dir.symLink(io, obj.bytes, entry.name, .{}) catch return error.IoFailed;
 }
 
-fn checkoutSubtree(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry: Tree.Entry, strategy: Strategy, diag: ?*?Diagnostic) Error!void {
+fn checkoutSubtree(gpa: Allocator, io: std.Io, odb: *Odb, git_dir: std.Io.Dir, dir: std.Io.Dir, entry: Tree.Entry, strategy: Strategy, diag: ?*?Diagnostic) Error!void {
     const existing = try statExisting(dir, io, entry.name);
     if (decide(existing, .directory, strategy) == .skip) return;
     if (existing != .absent and existing != .directory) try clearExisting(dir, io, entry.name, existing);
@@ -487,7 +505,7 @@ fn checkoutSubtree(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry
     var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch return error.IoFailed;
     defer sub.close(io);
 
-    try checkoutInto(gpa, io, odb, sub, entry.oid, strategy, diag);
+    try checkoutInto(gpa, io, odb, sub, git_dir, entry.oid, strategy, diag);
 }
 
 /// A gitlink names a commit in another repository, one this `Odb` has
@@ -613,7 +631,7 @@ fn expectPathEscapes(gpa: Allocator, io: std.Io, odb: *Odb, worktree: std.Io.Dir
     const bogus_oid = try Oid.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = name, .oid = bogus_oid }};
     const tree_oid = try writeTree(gpa, odb, &entries);
-    try std.testing.expectError(error.PathEscapesWorktree, checkoutTree(gpa, io, odb, worktree, tree_oid, populate, null));
+    try std.testing.expectError(error.PathEscapesWorktree, checkoutTree(gpa, io, odb, worktree, worktree, tree_oid, populate, null));
 }
 
 // expected
@@ -630,7 +648,7 @@ test "checkoutTree writes a blob with its exact committed bytes" {
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "greeting.txt");
     defer gpa.free(bytes);
@@ -651,7 +669,7 @@ test "checkoutTree creates nested directories" {
     var outer_entries = [_]Tree.Entry{.{ .mode = .tree, .name = "src", .oid = inner_oid }};
     const outer_oid = try writeTree(gpa, &repo.odb, &outer_entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, outer_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, outer_oid, populate, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "src/main.zig");
     defer gpa.free(bytes);
@@ -670,7 +688,7 @@ test "checkoutTree honours the executable bit" {
     var entries = [_]Tree.Entry{.{ .mode = .blob_executable, .name = "run.sh", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     const st = try repo.worktree.statFile(io, "run.sh", .{});
     try std.testing.expect(@intFromEnum(st.permissions) & 0o111 != 0);
@@ -688,7 +706,7 @@ test "checkoutTree writes a symlink as a symlink" {
     var entries = [_]Tree.Entry{.{ .mode = .symlink, .name = "link", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     const st = try repo.worktree.statFile(io, "link", .{ .follow_symlinks = false });
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, st.kind);
@@ -713,7 +731,7 @@ test "checkoutTree creates an empty directory for a gitlink and does not recurse
     var entries = [_]Tree.Entry{.{ .mode = .gitlink, .name = "vendor", .oid = nonexistent_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{}, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{}, null);
 
     var sub = try repo.worktree.openDir(io, "vendor", .{ .iterate = true });
     defer sub.close(io);
@@ -733,10 +751,10 @@ test "recreate_missing restores a file that was deleted" {
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "config.txt", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
     try repo.worktree.deleteFile(io, "config.txt");
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{ .recreate_missing = true }, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{ .recreate_missing = true }, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "config.txt");
     defer gpa.free(bytes);
@@ -755,10 +773,10 @@ test "remove_untracked deletes a file the tree does not name" {
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "keep.txt", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
     try repo.worktree.writeFile(io, .{ .sub_path = "extra.txt", .data = "untracked\n" });
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{ .remove_untracked = true }, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{ .remove_untracked = true }, null);
 
     try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "extra.txt", .{}));
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "keep.txt");
@@ -778,7 +796,7 @@ test "remove_untracked never deletes .git" {
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "keep.txt", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     // A real repository's own `.git`, sitting right where a top-level
     // `remove_untracked` walk would otherwise find it unnamed by any tree.
@@ -786,7 +804,7 @@ test "remove_untracked never deletes .git" {
     try repo.worktree.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/main\n" });
     try repo.worktree.writeFile(io, .{ .sub_path = "extra.txt", .data = "untracked\n" });
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{ .remove_untracked = true }, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{ .remove_untracked = true }, null);
 
     try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "extra.txt", .{}));
     const head_bytes = try readAllAlloc(gpa, io, repo.worktree, ".git/HEAD");
@@ -809,7 +827,7 @@ test "a blob with CRLF in it is written byte for byte, with no filtering" {
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "crlf.txt", .oid = blob_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "crlf.txt");
     defer gpa.free(bytes);
@@ -874,7 +892,7 @@ test "checkoutTree without force refuses to overwrite a modified file" {
 
     try repo.worktree.writeFile(io, .{ .sub_path = "greeting.txt", .data = "locally modified\n" });
 
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{}, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{}, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "greeting.txt");
     defer gpa.free(bytes);
@@ -913,7 +931,7 @@ test "a checkout that fails partway leaves no partial file at the failing path" 
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "will-fail.txt", .oid = oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
-    try std.testing.expectError(error.CorruptObject, checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null));
+    try std.testing.expectError(error.CorruptObject, checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null));
 
     try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "will-fail.txt", .{}));
     var it = repo.worktree.iterate();
@@ -937,7 +955,7 @@ test "a large blob streams rather than being buffered whole" {
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
 
     var failing = std.testing.FailingAllocator.init(gpa, .{});
-    try checkoutTree(failing.allocator(), io, &repo.odb, repo.worktree, tree_oid, populate, null);
+    try checkoutTree(failing.allocator(), io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null);
 
     // A whole-blob buffer would show up here as one allocation at or past
     // `big_len` (4 MiB). `checkoutInto` does pay a fixed, small cost of its
@@ -972,7 +990,7 @@ test "a tree entry with an empty name never reaches path validation, or a file w
     const bogus_oid = try Oid.parse(.sha1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "", .oid = bogus_oid }};
     const tree_oid = try writeTree(gpa, &repo.odb, &entries);
-    try std.testing.expectError(error.CorruptObject, checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null));
+    try std.testing.expectError(error.CorruptObject, checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null));
 
     try std.testing.expectError(error.PathEscapesWorktree, validateEntryName(""));
 }
@@ -1093,7 +1111,7 @@ test "a tree naming the reserved temp name is refused, and no sibling is lost ei
 
     try std.testing.expectError(
         error.NameReservedForCheckout,
-        checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null),
+        checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, populate, null),
     );
 
     // The sibling sorted, and so was checked out, before the reserved
@@ -1121,7 +1139,7 @@ test "checkoutTree with a default Strategy populates a fresh worktree" {
 
     // `.{}` on its own, with no flag set, still writes: `recreate_missing`
     // defaults to `true` precisely so this is not a silent no-op.
-    try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, .{}, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, repo.worktree, tree_oid, .{}, null);
 
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "greeting.txt");
     defer gpa.free(bytes);
