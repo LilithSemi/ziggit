@@ -167,14 +167,21 @@ const UrlKind = union(enum) {
 
 fn classifyUrl(url: []const u8) UrlKind {
     const separator = "://";
-    const at = std.mem.indexOf(u8, url, separator) orelse return .{ .local = url };
-    const scheme = url[0..at];
-    const rest = url[at + separator.len ..];
-    if (std.mem.eql(u8, scheme, "file")) return .{ .local = rest };
-    if (std.mem.eql(u8, scheme, "http")) return .http;
-    if (std.mem.eql(u8, scheme, "https")) return .https;
-    if (std.mem.eql(u8, scheme, "ssh")) return .ssh;
-    return .unknown;
+    if (std.mem.indexOf(u8, url, separator)) |at| {
+        const scheme = url[0..at];
+        const rest = url[at + separator.len ..];
+        if (std.mem.eql(u8, scheme, "file")) return .{ .local = rest };
+        if (std.mem.eql(u8, scheme, "http")) return .http;
+        if (std.mem.eql(u8, scheme, "https")) return .https;
+        if (std.mem.eql(u8, scheme, "ssh")) return .ssh;
+        return .unknown;
+    }
+    // `user@host:path` is the commonest way an ssh remote is written.
+    // Reading it as a path, which this did until it was reported, opens it
+    // as a directory and then reports a repository that is not there, so
+    // the error names the wrong thing entirely.
+    if (transport_mod.isScpLike(url)) return .ssh;
+    return .{ .local = url };
 }
 
 /// Opens the repository at `source_path` for reading only. `error.NotFound`
@@ -1377,4 +1384,51 @@ test "fetch dispatches an ssh url to the ssh transport once a verifier is suppli
         .transport = .{ .connect_timeout_ms = 1000, .credentials = dummySshCredentials },
         .ssh = .{ .verifier = acceptAllHostKeys },
     }, null));
+}
+
+test "fetch sends an scp-like url to the ssh transport, not to the local strategy" {
+    // `git@host:path` was classified as a filesystem path until this was
+    // reported: `fetchLocal` then tried to open it as a directory and
+    // answered `NotFound`, an error about a repository rather than about
+    // ssh, which sends a reader looking in entirely the wrong place.
+    //
+    // `SshVerifierRequired` is the proof it took the ssh branch. The local
+    // branch cannot produce it, and no host is contacted to find out,
+    // because the missing verifier is refused before anything dials.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+
+    try testing.expectError(
+        error.SshVerifierRequired,
+        fetch(gpa, io, &dest, "git@example.com:LilithSemi/ziggit.git", .{ .refspecs = &rs }, null),
+    );
+}
+
+test "fetch still treats a path containing a colon as a local path" {
+    // The other side of the bound. A `/` before the `:` means an ordinary
+    // path that happens to carry a colon, and git reads it that way too.
+    // Routing this to ssh would break every such path at once.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+
+    // Not a repository, so NotFound: the local strategy looked at it,
+    // which is the point. An ssh route would have said something else.
+    try testing.expectError(
+        error.NotFound,
+        fetch(gpa, io, &dest, "./no/such:place", .{ .refspecs = &rs }, null),
+    );
 }

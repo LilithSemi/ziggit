@@ -416,9 +416,35 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
+/// True for git's scp-like remote spelling, `user@host:path`, which is the
+/// most common way an ssh remote is written.
+///
+/// Git's rule, measured against git 2.55 with `GIT_SSH_COMMAND` stubbed
+/// rather than assumed: there is no `://`, and a `:` comes before any `/`.
+/// An `@` is NOT required by git, and there is no drive-letter exception
+/// on a POSIX host, so git reads `C:/x` as host `C` there too. Both are
+/// easy to get wrong in the narrow direction, which is why they are
+/// written down here.
+///
+/// A `/` before the `:` means a path that merely contains a colon, such as
+/// `./relative:colon`, and stays local.
+pub fn isScpLike(url: []const u8) bool {
+    if (std.mem.indexOf(u8, url, "://") != null) return false;
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
+    // A leading colon names no host.
+    if (colon == 0) return false;
+    if (std.mem.indexOfScalar(u8, url, '/')) |slash| {
+        if (slash < colon) return false;
+    }
+    return true;
+}
+
 fn parseUrl(url: []const u8) Error!ParsedUrl {
     const prefix = "ssh://";
-    if (!std.mem.startsWith(u8, url, prefix)) return error.UnsupportedProtocol;
+    if (!std.mem.startsWith(u8, url, prefix)) {
+        if (isScpLike(url)) return parseScpUrl(url);
+        return error.UnsupportedProtocol;
+    }
     const rest = url[prefix.len..];
 
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.ProtocolError;
@@ -441,6 +467,39 @@ fn parseUrl(url: []const u8) Error!ParsedUrl {
     if (host.len == 0) return error.ProtocolError;
 
     return .{ .user = user, .host = host, .port = port, .path = path };
+}
+
+/// `user@host:path`, git's scp-like spelling.
+///
+/// **The path is kept exactly as written, and is NOT made absolute.** In
+/// this spelling `host:work/repo.git` names a path relative to the remote
+/// account's home directory, while `host:/srv/repo.git` names an absolute
+/// one. Rewriting the first into an `ssh://` url would silently turn it
+/// into the second, which is why this is parsed here rather than
+/// normalised into a string somewhere earlier.
+///
+/// **The user must be written.** Ssh itself falls back to the local
+/// account name, and this library reads no environment and no password
+/// database, so it has nothing to fall back to. A bare `host:path` is
+/// `error.ProtocolError` rather than a guess at `git`, which would be
+/// right for a forge and wrong everywhere else. Same rule as
+/// `Repository.OpenOptions.system_config_path`: the caller supplies what
+/// only the caller can know.
+///
+/// There is no port in this spelling. Git has none either: a second colon
+/// would be ambiguous with the path.
+fn parseScpUrl(url: []const u8) Error!ParsedUrl {
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return error.ProtocolError;
+    const authority = url[0..colon];
+    const path = url[colon + 1 ..];
+    if (path.len == 0) return error.ProtocolError;
+
+    const at = std.mem.lastIndexOfScalar(u8, authority, '@') orelse return error.ProtocolError;
+    const user = authority[0..at];
+    const host = authority[at + 1 ..];
+    if (user.len == 0 or host.len == 0) return error.ProtocolError;
+
+    return .{ .user = user, .host = host, .port = zurl_ssh.Client.default_port, .path = path };
 }
 
 /// `"git-upload-pack "` followed by `path` quoted with `zurl_scp.command`'s
@@ -961,4 +1020,52 @@ test "the ssh transport offers ssh_agent as an allowed credential shape" {
         Ssh.open(gpa, testing.io, url, .{ .credentials = Cb.get }, .{ .verifier = acceptAllVerifier }),
     );
     try testing.expect(Cb.saw_ssh_agent);
+}
+
+test "git's scp-like spelling is recognised, and a path with a colon in it is not" {
+    // Every case below was measured against git 2.55 with
+    // `GIT_SSH_COMMAND` stubbed, not reasoned about. Two are easy to get
+    // wrong in the narrow direction: git needs no `@`, and on a POSIX host
+    // it has no drive-letter exception either.
+    try testing.expect(isScpLike("git@github.com:LilithSemi/ziggit"));
+    try testing.expect(isScpLike("host.invalid:foo/bar"));
+    try testing.expect(isScpLike("git@host.invalid:/abs/path"));
+    try testing.expect(isScpLike("C:/drive/path"));
+
+    // A `/` before the `:` means a path that merely contains a colon.
+    try testing.expect(!isScpLike("./relative:colon"));
+    try testing.expect(!isScpLike("/tmp/abs:colon"));
+    // A url with a scheme is never scp-like.
+    try testing.expect(!isScpLike("ssh://git@host/path"));
+    try testing.expect(!isScpLike("https://host/path"));
+    // No colon at all, and a leading colon that names no host.
+    try testing.expect(!isScpLike("/plain/path"));
+    try testing.expect(!isScpLike(":nohost/path"));
+}
+
+test "an scp-like url keeps its path relative, rather than becoming absolute" {
+    // `host:work/repo.git` names a path relative to the remote account's
+    // home. Rewriting it into `ssh://host/work/repo.git` would quietly
+    // make it absolute and fetch the wrong thing, which is why this is
+    // parsed rather than normalised into a string.
+    const relative = try parseUrl("git@example.com:work/repo.git");
+    try testing.expectEqualStrings("git", relative.user);
+    try testing.expectEqualStrings("example.com", relative.host);
+    try testing.expectEqualStrings("work/repo.git", relative.path);
+    try testing.expectEqual(zurl_ssh.Client.default_port, relative.port);
+
+    const absolute = try parseUrl("git@example.com:/srv/repo.git");
+    try testing.expectEqualStrings("/srv/repo.git", absolute.path);
+}
+
+test "an scp-like url with no user is refused rather than guessed at" {
+    // Ssh falls back to the local account name. This library reads no
+    // environment and no password database, so it has nothing to fall
+    // back to, and guessing `git` would be right for a forge and wrong
+    // everywhere else.
+    try testing.expectError(error.ProtocolError, parseUrl("example.com:work/repo.git"));
+    try testing.expectError(error.ProtocolError, parseUrl("@example.com:work/repo.git"));
+    try testing.expectError(error.ProtocolError, parseUrl("git@:work/repo.git"));
+    // A host and a user but no path at all.
+    try testing.expectError(error.ProtocolError, parseUrl("git@example.com:"));
 }
