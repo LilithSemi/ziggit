@@ -36,6 +36,39 @@ pub const Stat = struct {
     gid: u32,
 };
 
+/// Builds an index stat block from what `std.Io` reports about a file.
+///
+/// **`dev`, `uid` and `gid` are zero, and that is a limit of `std.Io`, not
+/// an oversight.** `std.Io.File.Stat` carries `inode`, `mtime`, `ctime` and
+/// `size` and exposes no device id, owner or group at all. Git compares all
+/// six by default (`core.checkStat`), so a zeroed trio makes its stat check
+/// miss and git falls back to comparing the file's content. The answer it
+/// reports stays correct; only the work is wasted, and git rewrites the
+/// index with its own values the first time it writes one.
+///
+/// Do not "fix" this by inventing values. A wrong device id is worse than a
+/// zero: zero reliably means "compare the content", while a plausible wrong
+/// one can match by accident and skip a file that really did change.
+pub fn statFromFile(s: std.Io.File.Stat) Stat {
+    const ns_per_s = std.time.ns_per_s;
+    const ctime_ns = s.ctime.nanoseconds;
+    const mtime_ns = s.mtime.nanoseconds;
+    const ctime_s = @divFloor(ctime_ns, ns_per_s);
+    const mtime_s = @divFloor(mtime_ns, ns_per_s);
+    // Git stores each of these as a 32 bit field, so a timestamp past 2106
+    // wraps here exactly as it does in git's own index.
+    return .{
+        .ctime_seconds = @truncate(@as(u96, @bitCast(ctime_s))),
+        .ctime_nanoseconds = @intCast(ctime_ns - ctime_s * ns_per_s),
+        .mtime_seconds = @truncate(@as(u96, @bitCast(mtime_s))),
+        .mtime_nanoseconds = @intCast(mtime_ns - mtime_s * ns_per_s),
+        .dev = 0,
+        .ino = @truncate(s.inode),
+        .uid = 0,
+        .gid = 0,
+    };
+}
+
 pub const Entry = struct {
     path: []const u8, // owned
     oid: Oid,
@@ -990,7 +1023,7 @@ fn walkDirectory(
                 path_buf[current_path_len] = '/';
                 current_path_len += 1;
 
-                var subdir = current.openDir(io, entry.name, .{}) catch return error.IoFailed;
+                var subdir = current.openDir(io, entry.name, .{ .iterate = true }) catch return error.IoFailed;
                 defer subdir.close(io);
                 try walkDirectory(gpa, io, root, subdir, odb, f, entries, path_buf, current_path_len);
             },
@@ -1029,16 +1062,7 @@ fn walkDirectory(
                     .mode = mode,
                     .stage = .merged,
                     .size = @intCast(stat.size),
-                    .stat = .{
-                        .ctime_seconds = 0,
-                        .ctime_nanoseconds = 0,
-                        .mtime_seconds = 0,
-                        .mtime_nanoseconds = 0,
-                        .dev = 0,
-                        .ino = 0,
-                        .uid = 0,
-                        .gid = 0,
-                    },
+                    .stat = statFromFile(stat),
                 };
 
                 try entries.append(gpa, idx_entry);
@@ -1062,16 +1086,7 @@ fn walkDirectory(
                     .mode = .symlink,
                     .stage = .merged,
                     .size = @intCast(stat.size),
-                    .stat = .{
-                        .ctime_seconds = 0,
-                        .ctime_nanoseconds = 0,
-                        .mtime_seconds = 0,
-                        .mtime_nanoseconds = 0,
-                        .dev = 0,
-                        .ino = 0,
-                        .uid = 0,
-                        .gid = 0,
-                    },
+                    .stat = statFromFile(stat),
                 };
 
                 try entries.append(gpa, idx_entry);
@@ -1264,4 +1279,144 @@ test "the index is written through a lock file and none is left behind" {
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "index.lock", .{}));
     try std.testing.expect(!std.mem.containsAtLeast(u8, index_content, 1, lock_bytes));
+}
+
+// Staging tests. The first is the one that matters: it pins the walk, the
+// modes, the paths and the hashing all at once against a tree id real git
+// produced, rather than against anything ziggit computed.
+
+const tree_builder = @import("ziggit-odb").writeTreeFromIndex;
+
+fn stagingFixture(io: std.Io, dir: std.Io.Dir) !void {
+    try dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    try dir.createDirPath(io, "d");
+    try dir.writeFile(io, .{ .sub_path = "d/b.txt", .data = "nested\n" });
+    try dir.writeFile(io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\n" });
+    var f = try dir.openFile(io, "run.sh", .{});
+    defer f.close(io);
+    try f.setPermissions(io, @enumFromInt(0o755));
+}
+
+/// The object database lives OUTSIDE the staged worktree, as a real
+/// repository's does under `.git`. Putting it inside meant the walk
+/// descended into the objects it was writing as it wrote them.
+fn stagingOdb(gpa: Allocator, io: std.Io, dir: std.Io.Dir) !Odb {
+    try dir.createDirPath(io, "objects");
+    const objects = try dir.openDir(io, "objects", .{ .iterate = true });
+    return Odb.init(gpa, io, objects, .sha1, .{});
+}
+
+test "staging a worktree and writing its tree matches real git" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try stagingFixture(io, tmp.dir);
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    defer index.deinit();
+
+    const root = try tree_builder(gpa, &odb, index, null);
+    var buf: [Oid.max_formatted_length]u8 = undefined;
+    try std.testing.expectEqualStrings("dc388fc74b7ae653cebc33b4d91de4fc84b13394", root.toHex(&buf));
+}
+
+test "a repository directory inside the worktree is not staged" {
+    // The real consumer initialises its repository at the very path it
+    // stages, so `.git` is inside the walked tree. Staging it produces a
+    // garbage index and tree with no error at all.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try stagingFixture(io, tmp.dir);
+
+    // The layout `Repository.init` creates, built by hand: `ziggit-index`
+    // cannot import `ziggit-repo` without inverting the module layering,
+    // and what this test needs is a real `.git` directory with real files
+    // in it, which this is.
+    try tmp.dir.createDirPath(io, ".git/objects/pack");
+    try tmp.dir.createDirPath(io, ".git/refs/heads");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/master\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/config", .data = "[core]\n\tbare = false\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    defer index.deinit();
+
+    for (index.entries) |e| {
+        try std.testing.expect(!std.mem.startsWith(u8, e.path, ".git"));
+    }
+    // And the tree is still exactly git's, which it cannot be if anything
+    // from `.git` crept in.
+    const root = try tree_builder(gpa, &odb, index, null);
+    var buf: [Oid.max_formatted_length]u8 = undefined;
+    try std.testing.expectEqualStrings("dc388fc74b7ae653cebc33b4d91de4fc84b13394", root.toHex(&buf));
+}
+
+test "a file named git~1 is staged" {
+    // The other side of the bound. Checkout refuses `git~1` because a
+    // hostile TREE can use it to reach `.git` on an NTFS filesystem. Staging
+    // reads names a person already has on disk, and on Linux `git~1` is an
+    // ordinary filename, so refusing it here would silently lose a real
+    // file. Without this test nothing stops the narrow rule drifting into
+    // the wide one.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "git~1", .data = "ordinary\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    defer index.deinit();
+
+    var found = false;
+    for (index.entries) |e| {
+        if (std.mem.eql(u8, e.path, "git~1")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "a staged entry records the stat fields std.Io exposes and zeroes the rest" {
+    // Asserts the DOCUMENTED behaviour, not a hoped-for one. `std.Io.File.Stat`
+    // carries no dev, uid or gid, so those are zero on purpose; see
+    // `statFromFile`.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+
+    var odb_tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer odb_tmp.cleanup();
+    var odb = try stagingOdb(gpa, io, odb_tmp.dir);
+    defer odb.deinit();
+
+    var index = try stageWorktree(gpa, io, tmp.dir, &odb, .sha1);
+    defer index.deinit();
+
+    const e = index.find("a.txt").?;
+    try std.testing.expectEqual(@as(u32, 6), e.size);
+    // Recorded, because std.Io reports them.
+    try std.testing.expect(e.stat.mtime_seconds != 0);
+    try std.testing.expect(e.stat.ctime_seconds != 0);
+    try std.testing.expect(e.stat.ino != 0);
+    // Zero, because std.Io does not report them.
+    try std.testing.expectEqual(@as(u32, 0), e.stat.dev);
+    try std.testing.expectEqual(@as(u32, 0), e.stat.uid);
+    try std.testing.expectEqual(@as(u32, 0), e.stat.gid);
 }

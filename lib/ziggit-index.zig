@@ -4,6 +4,8 @@
 const index_mod = @import("ziggit-index/Index.zig");
 pub const Stage = index_mod.Stage;
 pub const Entry = index_mod.Entry;
+pub const Stat = index_mod.Stat;
+pub const statFromFile = index_mod.statFromFile;
 pub const Error = index_mod.Error;
 pub const Index = index_mod.Index;
 pub const write = index_mod.write;
