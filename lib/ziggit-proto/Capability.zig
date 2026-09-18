@@ -261,3 +261,43 @@ test "parseCapabilities refuses an object-format we do not implement" {
 
     try std.testing.expectError(error.UnsupportedProtocol, parseCapabilities(gpa, &r, &buf, &msg));
 }
+
+test "a server that answers ERR is refused by name, carrying its own message" {
+    // Captured from a real git daemon asked for a repository it does not
+    // export: it sends one `ERR <message>` pkt-line in place of an
+    // advertisement, and git prints that text as "remote error: ...".
+    //
+    // Before this, the line parsed as "the first line is not version 2" and
+    // every transport reported UnsupportedProtocol, telling a reader their
+    // server was too old when they had simply named a repository that is
+    // not there.
+    const gpa = std.testing.allocator;
+    const vector = "003eERR access denied or repository not exported: /missing.git";
+    var r: std.Io.Reader = .fixed(vector);
+    var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
+
+    try std.testing.expectError(
+        error.RemoteRefused,
+        parseCapabilities(gpa, &r, &buf, &msg),
+    );
+    try std.testing.expectEqualStrings(
+        "access denied or repository not exported: /missing.git",
+        msg.?,
+    );
+}
+
+test "an advertisement leaves the remote message untouched" {
+    // The other side of the bound: a normal advertisement must not set the
+    // out-parameter, or a caller would free something it never received.
+    const gpa = std.testing.allocator;
+    var r: std.Io.Reader = .fixed(advertisement_vector);
+    var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| gpa.free(m);
+
+    var caps = try parseCapabilities(gpa, &r, &buf, &msg);
+    defer caps.deinit(gpa);
+    try std.testing.expect(msg == null);
+}
