@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -127,6 +127,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         try lsTree(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "rev-parse")) {
         try revParseCmd(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        try statusCmd(gpa, io, &repo, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "check-ignore")) {
         try checkIgnore(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "show-ref")) {
@@ -734,4 +736,62 @@ fn checkIgnore(
     }
 
     if (!any) return error.NoneIgnored;
+}
+
+/// `ziggit status`, matching `git status --porcelain=v1 --untracked-files=all
+/// --no-renames`: two columns then the path, one line each, sorted.
+fn statusCmd(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const worktree = repo.layout.work_tree orelse {
+        try stderr.writeAll("ziggit: status needs a working tree\n");
+        return error.UsageError;
+    };
+
+    var index = ziggit.WorktreeIndex.open(gpa, io, repo.layout.common_dir, repo.format) catch |err| switch (err) {
+        // No index yet is an empty index, not a fault: that is what a fresh
+        // repository looks like before anything is staged.
+        error.IndexNotFound => ziggit.WorktreeIndex{ .gpa = gpa, .entries = &.{} },
+        else => return err,
+    };
+    defer index.deinit();
+
+    var m = ziggit.IgnoreMatcher.init(gpa);
+    defer m.deinit();
+    try m.addFile(io, repo.layout.common_dir, "info/exclude", "");
+
+    // HEAD's tree, or null on an unborn branch.
+    var head_tree: ?ziggit.Oid = null;
+    if (repo.head(null)) |head_oid| {
+        head_tree = ziggit.peel(gpa, repo, head_oid, .tree) catch null;
+    } else |_| {}
+
+    var result = try ziggit.status(gpa, io, worktree, &repo.odb, index, repo.format, .{
+        .ignore = &m,
+        .head_tree = head_tree,
+    }, null);
+    defer result.deinit(gpa);
+
+    for (result.changes) |c| {
+        if (c.untracked) {
+            try stdout.print("?? {s}\n", .{c.path});
+            continue;
+        }
+        const x: u8 = switch (c.staged) {
+            .unchanged => ' ',
+            .added => 'A',
+            .modified => 'M',
+            .deleted => 'D',
+        };
+        const y: u8 = switch (c.worktree) {
+            .unchanged => ' ',
+            .modified => 'M',
+            .deleted => 'D',
+        };
+        try stdout.print("{c}{c} {s}\n", .{ x, y, c.path });
+    }
 }

@@ -91,6 +91,13 @@ pub const classifyUrl = @import("ziggit-fetch").classifyUrl;
 // order, so it is the caller's to keep.
 pub const IgnoreMatcher = @import("ziggit-ignore").Matcher;
 
+// What differs between HEAD, the index and the working tree: git's two
+// porcelain columns, plus the untracked set.
+pub const status = @import("ziggit-status").status;
+pub const StatusResult = @import("ziggit-status").Result;
+pub const StatusChange = @import("ziggit-status").Change;
+pub const StatusOptions = @import("ziggit-status").Options;
+
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;
 pub const updateAll = @import("ziggit-submodule").updateAll;

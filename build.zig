@@ -241,6 +241,24 @@ pub fn build(b: *std.Build) void {
     // after index in this file, so add this import after odb exists.
     index.addImport("ziggit-odb", odb);
 
+    // What differs between HEAD, the index and the working tree. The two
+    // porcelain columns and the untracked set, which need the index, the
+    // object database, tree objects and the ignore rules together.
+    const status = b.addModule("ziggit-status", .{
+        .root_source_file = b.path("lib/ziggit-status.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-object", .module = object },
+            .{ .name = "ziggit-odb", .module = odb },
+            .{ .name = "ziggit-index", .module = index },
+            .{ .name = "ziggit-ignore", .module = ignore },
+        },
+    });
+    addModuleTests(b, test_step, status);
+
     // The top of the core: repository discovery, the on-disk layout, and
     // the `Repository` that ties the object database, the ref store, and
     // config into one thing. This is the one module that knows how the
@@ -345,6 +363,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-fetch", fetch);
     ziggit.addImport("ziggit-submodule", submodule);
     ziggit.addImport("ziggit-ignore", ignore);
+    ziggit.addImport("ziggit-status", status);
     addModuleTests(b, test_step, ziggit);
 
     // The plumbing CLI: the one place in this project allowed to print,
