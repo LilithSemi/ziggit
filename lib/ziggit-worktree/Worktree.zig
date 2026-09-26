@@ -34,6 +34,8 @@ const Diagnostic = core_mod.Diagnostic;
 const repo_mod = @import("ziggit-repo");
 const Repository = repo_mod.Repository;
 
+const odb_mod = @import("ziggit-odb");
+const object_mod = @import("ziggit-object");
 const checkout_mod = @import("ziggit-checkout");
 const status_mod = @import("ziggit-status");
 const index_mod = @import("ziggit-index");
@@ -214,4 +216,293 @@ fn requireEmpty(io: std.Io, dir: std.Io.Dir) Error!void {
 
 fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) Error!void {
     dir.writeFile(io, .{ .sub_path = path, .data = data }) catch return error.IoFailed;
+}
+
+// Tests
+
+const testing = std.testing;
+const Commit = object_mod.Commit;
+const Tree = object_mod.Tree;
+const Identity = core_mod.Identity;
+const Odb = odb_mod.Odb;
+
+const Fixture = struct {
+    tmp: testing.TmpDir,
+    repo: Repository,
+
+    fn init(gpa: Allocator, io: std.Io) !Fixture {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+
+        try Repository.init(gpa, io, tmp.dir, .{});
+
+        var layout = try repo_mod.discover(gpa, io, tmp.dir, .{}, null);
+        errdefer layout.deinit(io);
+
+        const r = try Repository.open(gpa, io, layout, .{}, null);
+
+        try tmp.dir.createDirPath(io, "worktrees");
+
+        return .{ .tmp = tmp, .repo = r };
+    }
+
+    fn deinit(fx: *Fixture) void {
+        fx.repo.deinit();
+        fx.tmp.cleanup();
+    }
+};
+
+fn writeCommit(gpa: Allocator, odb: *Odb, tree_oid: Oid) !Oid {
+    const now = Identity{
+        .name = "Test",
+        .email = "test@example.com",
+        .when = 1234567890,
+        .tz_offset_minutes = 0,
+    };
+
+    var commit: object_mod.Commit = .{
+        .tree = tree_oid,
+        .parents = &.{},
+        .author = now,
+        .committer = now,
+        .extra_headers = &.{},
+        .message = "Test commit",
+    };
+    defer commit.deinit(gpa);
+
+    var writer = try std.Io.Writer.Allocating.initCapacity(gpa, 256);
+    defer writer.deinit();
+    try commit.write(&writer.writer);
+    return odb.write(.commit, writer.writer.buffered(), null);
+}
+
+fn writeTree(gpa: Allocator, odb: *Odb, entries: []object_mod.Tree.Entry) !Oid {
+    object_mod.Tree.sortEntries(entries);
+
+    var writer = try std.Io.Writer.Allocating.initCapacity(gpa, 256);
+    defer writer.deinit();
+    const tree: object_mod.Tree = .{ .entries = entries };
+    try tree.write(&writer.writer);
+    return odb.write(.tree, writer.writer.buffered(), null);
+}
+
+fn expectFileContains(io: std.Io, dir: std.Io.Dir, path: []const u8, expected: []const u8) !void {
+    const bytes = try dir.readFileAlloc(io, path, testing.allocator, .limited(8192));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings(expected, bytes);
+}
+
+test "add writes commondir, gitdir, HEAD and ORIG_HEAD" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const admin = try fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{});
+    defer admin.close(io);
+
+    try expectFileContains(io, admin, "commondir", "../..\n");
+
+    const head_bytes = try admin.readFileAlloc(io, "HEAD", gpa, .limited(100));
+    defer gpa.free(head_bytes);
+    try testing.expect(std.mem.endsWith(u8, head_bytes, "\n"));
+    try testing.expectEqual(@as(usize, 41), head_bytes.len);
+
+    const orig_head_bytes = try admin.readFileAlloc(io, "ORIG_HEAD", gpa, .limited(100));
+    defer gpa.free(orig_head_bytes);
+    try testing.expect(std.mem.endsWith(u8, orig_head_bytes, "\n"));
+    try testing.expectEqual(@as(usize, 41), orig_head_bytes.len);
+    try testing.expectEqualStrings(head_bytes, orig_head_bytes);
+}
+
+test "add writes gitdir pointing to the worktree's .git file" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const gitdir_content = try fx.repo.layout.common_dir.readFileAlloc(io, "worktrees/w/gitdir", gpa, .limited(4096));
+    defer gpa.free(gitdir_content);
+    try testing.expect(std.mem.endsWith(u8, gitdir_content, "/.git\n"));
+    try testing.expect(std.mem.endsWith(u8, gitdir_content, "/w/.git\n"));
+}
+
+test "add checks out the tree into the worktree" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello world\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try expectFileContains(io, worktree, "greeting.txt", "hello world\n");
+}
+
+test "add writes an index by default" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "a.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const admin = try fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{});
+    defer admin.close(io);
+    _ = try admin.statFile(io, "index", .{});
+}
+
+test "add refuses to write index when AddOptions.write_index is false" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "a.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{ .write_index = false }, null);
+
+    const admin = try fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{});
+    defer admin.close(io);
+    try testing.expectError(error.FileNotFound, admin.statFile(io, "index", .{}));
+}
+
+test "add refuses a directory that is not empty" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try worktree.writeFile(io, .{ .sub_path = "existing.txt", .data = "stuff" });
+
+    try testing.expectError(error.WorktreeNotEmpty, add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null));
+}
+
+test "add refuses a name that already exists" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try fx.tmp.dir.createDirPath(io, "w2");
+    const worktree2 = try fx.tmp.dir.openDir(io, "w2", .{ .iterate = true });
+    defer worktree2.close(io);
+
+    try testing.expectError(error.WorktreeExists, add(gpa, io, &fx.repo, "w", worktree2, commit_oid, .{}, null));
+}
+
+test "remove deletes both the worktree directory and worktrees/<name>" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try remove(gpa, io, &fx.repo, "w", .{}, null);
+
+    try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
+}
+
+test "remove refuses when worktree has a modified file and succeeds with force" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try worktree.writeFile(io, .{ .sub_path = "greeting.txt", .data = "goodbye\n" });
+
+    try testing.expectError(error.WorktreeDirty, remove(gpa, io, &fx.repo, "w", .{}, null));
+
+    try remove(gpa, io, &fx.repo, "w", .{ .force = true }, null);
+
+    try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
 }

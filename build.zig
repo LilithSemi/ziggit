@@ -353,7 +353,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ziggit-oid", .module = oid },
             .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-object", .module = object },
             .{ .name = "ziggit-repo", .module = repo },
+            .{ .name = "ziggit-odb", .module = odb },
             .{ .name = "ziggit-checkout", .module = checkout },
             .{ .name = "ziggit-status", .module = status },
             .{ .name = "ziggit-index", .module = index },
