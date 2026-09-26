@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -127,6 +127,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         try lsTree(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "rev-parse")) {
         try revParseCmd(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "worktree")) {
+        try worktreeCmd(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "status")) {
         try statusCmd(gpa, io, &repo, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "check-ignore")) {
@@ -794,4 +796,68 @@ fn statusCmd(
         };
         try stdout.print("{c}{c} {s}\n", .{ x, y, c.path });
     }
+}
+
+/// `ziggit worktree add <path>` and `ziggit worktree remove <path>`, matching
+/// the shape of git's own subcommands. `add` is always detached at HEAD,
+/// which is the only form this library creates.
+fn worktreeCmd(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    if (args.len != 2) {
+        try stderr.writeAll("usage: ziggit worktree (add|remove) <path>\n");
+        return error.UsageError;
+    }
+    const verb = args[0];
+    const path = args[1];
+    const name = std.fs.path.basename(path);
+
+    var cwd = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch |err| {
+        try stderr.print("ziggit: cannot open the current directory: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer cwd.close(io);
+
+    if (std.mem.eql(u8, verb, "add")) {
+        cwd.createDirPath(io, path) catch |err| {
+            try stderr.print("ziggit: cannot create '{s}': {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        var dir = cwd.openDir(io, path, .{ .iterate = true }) catch |err| {
+            try stderr.print("ziggit: cannot open '{s}': {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        defer dir.close(io);
+
+        var diag: ?Diagnostic = null;
+        const head = repo.head(null) catch |err| {
+            try reportDiag(gpa, stderr, "worktree add", err, &diag, "HEAD");
+            return err;
+        };
+        ziggit.worktreeAdd(gpa, io, repo, name, dir, head, .{}, &diag) catch |err| {
+            try reportDiag(gpa, stderr, "worktree add", err, &diag, path);
+            return err;
+        };
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try dir.realPath(io, &buf);
+        try stdout.print("Preparing worktree (detached HEAD)\nworktree {s}\n", .{buf[0..len]});
+        return;
+    }
+
+    if (std.mem.eql(u8, verb, "remove")) {
+        var diag: ?Diagnostic = null;
+        ziggit.worktreeRemove(gpa, io, repo, name, .{}, &diag) catch |err| {
+            try reportDiag(gpa, stderr, "worktree remove", err, &diag, path);
+            return err;
+        };
+        return;
+    }
+
+    try stderr.writeAll("usage: ziggit worktree (add|remove) <path>\n");
+    return error.UsageError;
 }

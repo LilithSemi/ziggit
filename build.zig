@@ -344,6 +344,25 @@ pub fn build(b: *std.Build) void {
     });
     addModuleTests(b, test_step, submodule);
 
+    // Linked worktrees. Reading one already works through `ziggit-repo`;
+    // this creates and removes them.
+    const worktree = b.addModule("ziggit-worktree", .{
+        .root_source_file = b.path("lib/ziggit-worktree.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-repo", .module = repo },
+            .{ .name = "ziggit-checkout", .module = checkout },
+            .{ .name = "ziggit-status", .module = status },
+            .{ .name = "ziggit-index", .module = index },
+            .{ .name = "ziggit-ignore", .module = ignore },
+            .{ .name = "ziggit-revwalk", .module = revwalk },
+        },
+    });
+    addModuleTests(b, test_step, worktree);
+
     // The front package needs every module below wired in only now, once
     // each one exists: `lib/ziggit.zig` re-exports from all of them and
     // its own `test` block imports all of them, so its module must
@@ -364,6 +383,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-submodule", submodule);
     ziggit.addImport("ziggit-ignore", ignore);
     ziggit.addImport("ziggit-status", status);
+    ziggit.addImport("ziggit-worktree", worktree);
     addModuleTests(b, test_step, ziggit);
 
     // The plumbing CLI: the one place in this project allowed to print,

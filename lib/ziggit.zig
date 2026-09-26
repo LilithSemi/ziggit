@@ -98,6 +98,13 @@ pub const StatusResult = @import("ziggit-status").Result;
 pub const StatusChange = @import("ziggit-status").Change;
 pub const StatusOptions = @import("ziggit-status").Options;
 
+// Linked worktrees. Reading one already works through `Repository`; these
+// create and remove them.
+pub const worktreeAdd = @import("ziggit-worktree").add;
+pub const worktreeRemove = @import("ziggit-worktree").remove;
+pub const WorktreeAddOptions = @import("ziggit-worktree").AddOptions;
+pub const WorktreeRemoveOptions = @import("ziggit-worktree").RemoveOptions;
+
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;
 pub const updateAll = @import("ziggit-submodule").updateAll;
