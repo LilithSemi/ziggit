@@ -206,7 +206,13 @@ fn requireClean(
     }, diag);
     defer result.deinit(gpa);
 
-    if (!result.isClean()) return error.WorktreeDirty;
+    // Git refuses a worktree that "contains modified or untracked files", so
+    // only those two count. The staged column is not consulted: no HEAD is
+    // read here, which would otherwise make every entry look newly added and
+    // every worktree dirty.
+    for (result.changes) |c| {
+        if (c.untracked or c.worktree != .unchanged) return error.WorktreeDirty;
+    }
 }
 
 fn requireEmpty(io: std.Io, dir: std.Io.Dir) Error!void {
