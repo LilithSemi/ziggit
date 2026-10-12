@@ -1033,7 +1033,7 @@ test "a redirect target longer than the retry buffer is ProtocolError, not trunc
     var location_buf: [retry_url_len_max + 256]u8 = undefined;
     const location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.2:{d}/{s}", .{
         target_server.port(),
-        "x" ** (retry_url_len_max + 100),
+        &@as([retry_url_len_max + 100]u8, @splat('x')),
     });
 
     const redirect = try std.fmt.allocPrint(
@@ -1059,7 +1059,7 @@ test "a challenged host longer than the buffer is ProtocolError, not truncated" 
 
     // Build a hostname that exceeds challenged_host_len_max (256).
     var host_buf: [challenged_host_len_max + 128]u8 = undefined;
-    const host_part = "x" ** (challenged_host_len_max + 50);
+    const host_part = &@as([challenged_host_len_max + 50]u8, @splat('x'));
     const long_host = try std.fmt.bufPrint(&host_buf, "{s}.example.com", .{host_part});
 
     var target_server: TestServer = undefined;

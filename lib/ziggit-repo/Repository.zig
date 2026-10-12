@@ -297,10 +297,10 @@ pub const Repository = struct {
         var probe_file = dir.openFile(io, probe_name, .{}) catch return error.IoFailed;
         defer probe_file.close(io);
 
-        probe_file.setPermissions(io, @enumFromInt(0o755)) catch return error.IoFailed;
+        probe_file.setPermissions(io, @fromBackingInt(@intCast(0o755))) catch return error.IoFailed;
 
         const stat = probe_file.stat(io) catch return error.IoFailed;
-        const mode = @intFromEnum(stat.permissions);
+        const mode = @backingInt(stat.permissions);
         const has_exec = (mode & 0o111) != 0;
 
         return has_exec;
@@ -1132,7 +1132,7 @@ test "a shallow file whose line is the wrong length for the repository is corrup
 
     try tmp.dir.createDirPath(io, ".git/objects");
 
-    const hex = "a" ** 40;
+    const hex = &@as([40]u8, @splat('a'));
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/shallow", .data = hex ++ "\n" });
 
     try std.testing.expectError(

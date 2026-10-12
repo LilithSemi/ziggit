@@ -87,6 +87,6 @@ test "writeLine appends the newline git's command lines carry" {
 test "write rejects data longer than max_data_length" {
     var buffer: [Packet.max_data_length + 4]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    const data = [_]u8{0} ** (Packet.max_data_length + 1);
+    const data: [Packet.max_data_length + 1]u8 = @splat(0);
     try std.testing.expectError(error.PktLineTooLong, write(&w, .{ .data = &data }));
 }

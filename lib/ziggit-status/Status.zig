@@ -334,7 +334,7 @@ fn collectWorktree(
                 const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch return error.IoFailed;
                 const mode: FileMode = if (entry.kind == .sym_link)
                     .symlink
-                else if (@intFromEnum(stat.permissions) & 0o111 != 0)
+                else if (@backingInt(stat.permissions) & 0o111 != 0)
                     .blob_executable
                 else
                     .blob;

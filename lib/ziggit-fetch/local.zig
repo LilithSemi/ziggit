@@ -1370,7 +1370,7 @@ test "fetchLocal on a source it cannot open for a reason other than absence repo
     const source_path = try std.fmt.allocPrint(gpa, "{s}/no-access", .{tmp_path});
     defer gpa.free(source_path);
 
-    try tmp.dir.setFilePermissions(io, "no-access", @enumFromInt(0), .{});
+    try tmp.dir.setFilePermissions(io, "no-access", @fromBackingInt(@intCast(0)), .{});
 
     var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
     defer for (&rs) |*r| r.deinit(gpa);
@@ -1380,7 +1380,7 @@ test "fetchLocal on a source it cannot open for a reason other than absence repo
     // Restored before any assertion below can fail the test: leaving this
     // directory unreadable would otherwise make `tmp.cleanup()` itself
     // fail when this test tears down.
-    try tmp.dir.setFilePermissions(io, "no-access", @enumFromInt(0o755), .{});
+    try tmp.dir.setFilePermissions(io, "no-access", @fromBackingInt(@intCast(0o755)), .{});
 
     try testing.expectError(error.IoFailed, result);
     try testing.expect(diag != null);

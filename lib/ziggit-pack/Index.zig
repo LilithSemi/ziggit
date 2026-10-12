@@ -237,9 +237,9 @@ fn prefixOrder(format: Format, id_bytes: []const u8, hex_prefix: []const u8) std
 // fanout[0x00..0xff) = 1 (only id 0 has first byte <= 0x00)
 // fanout[0x01..0xff) = 2 (ids 0 and 1 have first byte <= 0x01..0xfe)
 // fanout[0xff]        = 3 (all three ids have first byte <= 0xff)
-const test_id_0 = [_]u8{0x00} ++ [_]u8{0x11} ** 19;
-const test_id_1 = [_]u8{0x01} ++ [_]u8{0x22} ** 19;
-const test_id_2 = [_]u8{0xff} ++ [_]u8{0x33} ** 19;
+const test_id_0 = [_]u8{0x00} ++ @as([19]u8, @splat(0x11));
+const test_id_1 = [_]u8{0x01} ++ @as([19]u8, @splat(0x22));
+const test_id_2 = [_]u8{0xff} ++ @as([19]u8, @splat(0x33));
 
 fn buildTestIndexBytes(gpa: Allocator) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -273,8 +273,8 @@ fn buildTestIndexBytes(gpa: Allocator) ![]u8 {
     try w.writeInt(u32, 99, .big);
     try w.writeInt(u64, 400_000_000, .big);
 
-    try w.writeAll(&([_]u8{0xaa} ** 20)); // pack checksum, unchecked
-    try w.writeAll(&([_]u8{0xbb} ** 20)); // index checksum, unchecked
+    try w.writeAll(&@as([20]u8, @splat(0xaa))); // pack checksum, unchecked
+    try w.writeAll(&@as([20]u8, @splat(0xbb))); // index checksum, unchecked
 
     return aw.toOwnedSlice();
 }
@@ -392,7 +392,7 @@ test "Index offsetOf returns null for an id that is absent" {
     var idx = try openTestIndex(gpa, tmp.dir, io);
     defer idx.deinit();
 
-    const absent = Oid.fromBytes(.sha1, &([_]u8{0x02} ++ [_]u8{0x00} ** 19));
+    const absent = Oid.fromBytes(.sha1, &([_]u8{0x02} ++ @as([19]u8, @splat(0))));
     try std.testing.expectEqual(@as(?u64, null), idx.offsetOf(absent));
 }
 
@@ -416,9 +416,9 @@ test "findPrefix reports two matches for an ambiguous prefix" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const id_a = [_]u8{0x01} ++ [_]u8{0x10} ** 19;
-    const id_b = [_]u8{0x01} ++ [_]u8{0x20} ** 19;
-    const id_c = [_]u8{0x02} ++ [_]u8{0x00} ** 19;
+    const id_a = [_]u8{0x01} ++ @as([19]u8, @splat(0x10));
+    const id_b = [_]u8{0x01} ++ @as([19]u8, @splat(0x20));
+    const id_c = [_]u8{0x02} ++ @as([19]u8, @splat(0));
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -439,8 +439,8 @@ test "findPrefix reports two matches for an ambiguous prefix" {
     try w.writeInt(u32, 1, .big);
     try w.writeInt(u32, 2, .big);
     try w.writeInt(u32, 3, .big);
-    try w.writeAll(&([_]u8{0xaa} ** 20));
-    try w.writeAll(&([_]u8{0xbb} ** 20));
+    try w.writeAll(&@as([20]u8, @splat(0xaa)));
+    try w.writeAll(&@as([20]u8, @splat(0xbb)));
     const bytes = try aw.toOwnedSlice();
     defer gpa.free(bytes);
 

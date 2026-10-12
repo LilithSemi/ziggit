@@ -256,7 +256,7 @@ fn printTreeEntries(gpa: Allocator, repo: *Repository, tree_oid: Oid, stdout: *s
 
     var hex_buf: [Oid.max_formatted_length]u8 = undefined;
     for (tree.entries) |entry| {
-        try stdout.print("{o:0>6} {s} {s}\t", .{ @intFromEnum(entry.mode), modeKind(entry.mode), entry.oid.toHex(&hex_buf) });
+        try stdout.print("{o:0>6} {s} {s}\t", .{ @backingInt(entry.mode), modeKind(entry.mode), entry.oid.toHex(&hex_buf) });
         try stdout.writeAll(entry.name);
         try stdout.writeByte('\n');
     }
@@ -323,7 +323,7 @@ fn lsTreeWalk(gpa: Allocator, repo: *Repository, tree_oid: Oid, prefix: []const 
             continue;
         }
 
-        try stdout.print("{o:0>6} {s} {s}\t", .{ @intFromEnum(entry.mode), modeKind(entry.mode), entry.oid.toHex(&hex_buf) });
+        try stdout.print("{o:0>6} {s} {s}\t", .{ @backingInt(entry.mode), modeKind(entry.mode), entry.oid.toHex(&hex_buf) });
         try stdout.writeAll(full_name);
         try stdout.writeByte('\n');
     }

@@ -789,7 +789,7 @@ fn buildDescription(
 
 const testing = std.testing;
 
-const dummy_tree_hex = "4" ** 40;
+const dummy_tree_hex = &@as([40]u8, @splat('4'));
 const identity_line = "A U Thor <author@example.com> 1700000000 +0000";
 
 fn buildMinimalRepo(io: std.Io, dir: std.Io.Dir) !void {
@@ -1405,7 +1405,7 @@ test "a ref that vanished between ls-refs and fetch is RefNotFound" {
     // The ls-refs listing simply does not carry the ref this literal
     // refspec asks for: the same shape a concurrent delete on the remote
     // would leave behind.
-    const other_oid = try Oid.parse(.sha1, "1" ** 40);
+    const other_oid = try Oid.parse(.sha1, &@as([40]u8, @splat('1')));
     const ls_refs_bytes = try buildLsRefsResponse(gpa, &.{.{ .oid = other_oid, .name = "refs/heads/other" }});
     defer gpa.free(ls_refs_bytes);
 

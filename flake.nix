@@ -58,7 +58,7 @@
           default = pkgs.mkShell {
             name = "ziggit-dev-shell";
             packages = with pkgs; [
-              zig
+              zig_0_17
               git
             ];
           };
@@ -76,13 +76,13 @@
 
             src = lib.cleanSource ./.;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-n+PUsg4vFhwcRhE0ggcOPpKnJvEnNbj4NJfInYPGhw8=";
+              hash = "sha256-EAMsH4tBy/Vmi6fMifHlig6KLpRKac9NVlp0hn0mpI8=";
             };
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             nativeCheckInputs = with pkgs; [

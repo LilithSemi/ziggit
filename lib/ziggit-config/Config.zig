@@ -61,7 +61,7 @@ const ValueList = struct {
         if (vl.levels.items.len == 0) return null;
         var best: usize = 0;
         for (vl.levels.items, 0..) |lvl, idx| {
-            if (@intFromEnum(lvl) >= @intFromEnum(vl.levels.items[best])) best = idx;
+            if (@backingInt(lvl) >= @backingInt(vl.levels.items[best])) best = idx;
         }
         return best;
     }

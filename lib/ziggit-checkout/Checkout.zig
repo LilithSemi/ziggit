@@ -519,7 +519,7 @@ fn checkoutBlob(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry: T
         fw.end() catch return error.IoFailed;
 
         if (entry.mode == .blob_executable) {
-            file.setPermissions(io, @enumFromInt(0o755)) catch return error.IoFailed;
+            file.setPermissions(io, @fromBackingInt(@intCast(0o755))) catch return error.IoFailed;
         }
     }
 
@@ -767,7 +767,7 @@ test "checkoutTree honours the executable bit" {
     try checkoutTree(gpa, io, &repo.odb, repo.worktree, tree_oid, populate, null);
 
     const st = try repo.worktree.statFile(io, "run.sh", .{});
-    try std.testing.expect(@intFromEnum(st.permissions) & 0o111 != 0);
+    try std.testing.expect(@backingInt(st.permissions) & 0o111 != 0);
 }
 
 test "checkoutTree writes a symlink as a symlink" {
@@ -990,10 +990,10 @@ test "a checkout that fails partway leaves no partial file at the failing path" 
     // temp file before it notices the mismatch at the very end, so this
     // proves a stream that got most of the way through still leaves
     // nothing at the real destination path.
-    const oid = try repo.odb.write(.blob, "a" ** 4096, null);
+    const oid = try repo.odb.write(.blob, &@as([4096]u8, @splat('a')), null);
     var aw = try std.Io.Writer.Allocating.initCapacity(gpa, 256);
     defer aw.deinit();
-    _ = try object_mod.loose.write(.sha1, .blob, "b" ** 10, &aw.writer);
+    _ = try object_mod.loose.write(.sha1, .blob, &@as([10]u8, @splat('b')), &aw.writer);
 
     var hex_buf: [Oid.max_formatted_length]u8 = undefined;
     const hex = oid.toHex(&hex_buf);

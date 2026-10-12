@@ -61,7 +61,7 @@ pub const Tree = struct {
     /// from the same entries git would have written.
     pub fn write(t: Tree, w: *std.Io.Writer) std.Io.Writer.Error!void {
         for (t.entries) |entry| {
-            try w.print("{o} ", .{@intFromEnum(entry.mode)});
+            try w.print("{o} ", .{@backingInt(entry.mode)});
             try w.writeAll(entry.name);
             try w.writeAll("\x00");
             try w.writeAll(entry.oid.slice());
@@ -235,13 +235,13 @@ test "tree entries sort directories as if they end in a slash" {
 
 test "Tree parse rejects an entry whose mode has a leading zero" {
     const gpa = std.testing.allocator;
-    const bytes = "040000 src\x00" ++ ("\x00" ** 20);
+    const bytes = "040000 src\x00" ++ @as([20]u8, @splat(0));
     try std.testing.expectError(error.CorruptTree, Tree.parse(gpa, .sha1, bytes));
 }
 
 test "Tree parse rejects a truncated oid at the end of the buffer" {
     const gpa = std.testing.allocator;
-    const bytes = "100644 a\x00" ++ ("\x00" ** 10); // 10 bytes, sha1 needs 20
+    const bytes = "100644 a\x00" ++ @as([10]u8, @splat(0)); // 10 bytes, sha1 needs 20
     try std.testing.expectError(error.CorruptTree, Tree.parse(gpa, .sha1, bytes));
 }
 

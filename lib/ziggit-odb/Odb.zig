@@ -759,7 +759,7 @@ test "read of a packed object whose declared size dwarfs the pack is rejected be
     // building the index) so the bound is proven at `Odb.read`, the
     // boundary a caller actually crosses, not only through
     // `ziggit-pack`'s internal `decompressAlloc`.
-    const oid = Oid.fromBytes(.sha1, &([_]u8{0x42} ** 20));
+    const oid = Oid.fromBytes(.sha1, &@as([20]u8, @splat(0x42)));
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -773,7 +773,7 @@ test "read of a packed object whose declared size dwarfs the pack is rejected be
     var compress = try std.compress.flate.Compress.init(w, &window, .zlib, .default);
     try compress.writer.writeAll("small");
     try compress.finish();
-    try w.writeAll(&([_]u8{0} ** 20)); // trailer, never checked by read
+    try w.writeAll(&@as([20]u8, @splat(0))); // trailer, never checked by read
     const pack_bytes = try aw.toOwnedSlice();
     defer gpa.free(pack_bytes);
 
@@ -791,8 +791,8 @@ test "read of a packed object whose declared size dwarfs the pack is rejected be
     try iwr.writeAll(oid.slice());
     try iwr.writeInt(u32, 0, .big); // crc32, never checked by read
     try iwr.writeInt(u32, @intCast(entry_start), .big);
-    try iwr.writeAll(&([_]u8{0xaa} ** 20)); // pack checksum, unchecked by Index.open
-    try iwr.writeAll(&([_]u8{0xbb} ** 20)); // index checksum, unchecked by Index.open
+    try iwr.writeAll(&@as([20]u8, @splat(0xaa))); // pack checksum, unchecked by Index.open
+    try iwr.writeAll(&@as([20]u8, @splat(0xbb))); // index checksum, unchecked by Index.open
     const idx_bytes = try iw.toOwnedSlice();
     defer gpa.free(idx_bytes);
 

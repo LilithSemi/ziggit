@@ -905,7 +905,7 @@ fn entryTypeOf(kind: ObjectKind) EntryType {
 
 fn writeVarintHeader(w: *std.Io.Writer, entry_type: EntryType, size_in: u64) !void {
     var value = size_in;
-    var first_byte: u8 = (@as(u8, @intFromEnum(entry_type)) << 4) | @as(u8, @truncate(value & 0x0f));
+    var first_byte: u8 = (@as(u8, @backingInt(entry_type)) << 4) | @as(u8, @truncate(value & 0x0f));
     value >>= 4;
     if (value != 0) first_byte |= 0x80;
     try w.writeByte(first_byte);
@@ -1272,7 +1272,7 @@ test "a ref delta naming its own id fails with DeltaCycle rather than looping" {
     // ever be produced by resolving this very entry, which can only ever
     // happen once its base id is known: nothing in the pack can complete
     // it, so this is a cycle of exactly one link, not a merely missing base.
-    const self_id = Oid.fromBytes(.sha1, &([_]u8{0xab} ** 20));
+    const self_id = Oid.fromBytes(.sha1, &@as([20]u8, @splat(0xab)));
     const patch = [_]u8{ 0, 1, 1, 'x' };
     var built = try buildTestPack(gpa, .sha1, &.{
         .{ .ref_delta = .{ .base_id = self_id, .patch = &patch } },
@@ -1340,7 +1340,7 @@ test "readAt rejects a pack that ends mid entry size varint" {
     // nonzero, so that first byte sets the continuation bit and a second
     // varint byte follows. Truncating right after that first byte leaves
     // the continuation promised but never delivered.
-    const payload = [_]u8{'x'} ** 200;
+    const payload: [200]u8 = @splat('x');
     var built = try buildTestPack(gpa, .sha1, &.{
         .{ .object = .{ .kind = .blob, .payload = &payload } },
     });
@@ -1367,7 +1367,7 @@ test "readAt rejects a pack that ends right after the entry header, before any d
     // checking the very next byte is the zlib stream's own CMF byte), then
     // nothing -- the entry header parses in full, but decompression starts
     // with zero bytes available rather than merely running out partway in.
-    const payload = [_]u8{'x'} ** 200;
+    const payload: [200]u8 = @splat('x');
     var built = try buildTestPack(gpa, .sha1, &.{
         .{ .object = .{ .kind = .blob, .payload = &payload } },
     });

@@ -255,7 +255,7 @@ pub fn isAncestor(gpa: Allocator, repo: *Repository, old: Oid, new: Oid, diag: ?
 
 const testing = std.testing;
 
-const dummy_tree_hex = "4" ** 40;
+const dummy_tree_hex = &@as([40]u8, @splat('4'));
 
 fn buildMinimalRepo(io: std.Io, dir: std.Io.Dir) !void {
     try dir.createDirPath(io, "objects/pack");
@@ -341,7 +341,7 @@ fn buildFakePackFile(gpa: Allocator, payloads: []const []const u8) !FakePack {
     }
     // Neither `Pack.open` nor this project's normal read path verifies
     // the trailing checksum; a placeholder of the right length is enough.
-    const zero_trailer = [_]u8{0} ** 20;
+    const zero_trailer: [20]u8 = @splat(0);
     try w.writeAll(&zero_trailer);
 
     const bytes = try aw.toOwnedSlice();
@@ -373,7 +373,7 @@ fn writeFakeIndex(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const
     for (entries) |e| try w.writeAll(e.oid.slice());
     for (entries) |_| try w.writeInt(u32, 0, .big); // crc32, never checked on read
     for (entries) |e| try w.writeInt(u32, @intCast(e.offset), .big);
-    const zero_digest = [_]u8{0} ** 20;
+    const zero_digest: [20]u8 = @splat(0);
     try w.writeAll(&zero_digest); // pack checksum, unvalidated by Index.open
     try w.writeAll(&zero_digest); // index checksum, unvalidated by Index.open
 
@@ -385,8 +385,8 @@ fn writeFakeIndex(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const
 /// never form this shape; this is a stand-in for whatever a hostile or
 /// damaged repository's on-disk graph could contain.
 fn buildFakeCycle(gpa: Allocator, io: std.Io, dir: std.Io.Dir, repo: *Repository) !struct { a: Oid, b: Oid } {
-    const oid_a: Oid = .{ .sha1 = [_]u8{0x11} ** 20 };
-    const oid_b: Oid = .{ .sha1 = [_]u8{0x22} ** 20 };
+    const oid_a: Oid = .{ .sha1 = @splat(0x11) };
+    const oid_b: Oid = .{ .sha1 = @splat(0x22) };
 
     var a_hex_buf: [Oid.max_formatted_length]u8 = undefined;
     var b_hex_buf: [Oid.max_formatted_length]u8 = undefined;
@@ -640,7 +640,7 @@ test "isAncestor treats a missing parent as a dead end, not a fault" {
 
     // Names a parent that was never written to the odb at all: exactly
     // what a shallow clone's boundary looks like.
-    const missing_hex = "f" ** 40;
+    const missing_hex = &@as([40]u8, @splat('f'));
     const tip_payload = try buildCommitPayload(gpa, &.{missing_hex}, 2000, "shallow tip");
     defer gpa.free(tip_payload);
     const tip = try repo.odb.write(.commit, tip_payload, null);
@@ -679,7 +679,7 @@ test "a commit at the shallow boundary is a dead end, not an error" {
     var repo = try openTestRepo(gpa, io, tmp.dir);
     defer repo.deinit();
 
-    const missing_parent_hex = "f" ** 40;
+    const missing_parent_hex = &@as([40]u8, @splat('f'));
     const boundary_payload = try buildCommitPayload(gpa, &.{missing_parent_hex}, 1000, "boundary");
     defer gpa.free(boundary_payload);
     const boundary = try repo.odb.write(.commit, boundary_payload, null);
@@ -706,7 +706,7 @@ test "a missing commit that is not at the shallow boundary is an error" {
     var repo = try openTestRepo(gpa, io, tmp.dir);
     defer repo.deinit();
 
-    const missing_parent_hex = "a" ** 40;
+    const missing_parent_hex = &@as([40]u8, @splat('a'));
     const tip_payload = try buildCommitPayload(gpa, &.{missing_parent_hex}, 1000, "tip with missing parent");
     defer gpa.free(tip_payload);
     const tip = try repo.odb.write(.commit, tip_payload, null);
@@ -724,7 +724,7 @@ test "a sha256 repository's shallow file parses" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    const hex = "b" ** 64;
+    const hex = &@as([64]u8, @splat('b'));
     try tmp.dir.writeFile(io, .{ .sub_path = "shallow", .data = hex ++ "\n" });
 
     var boundary = try readShallowBoundary(gpa, io, tmp.dir, .sha256, null);
@@ -742,7 +742,7 @@ test "a shallow line of the wrong length for the repository is corrupt" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "shallow", .data = "c" ** 40 ++ "\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "shallow", .data = &@as([40]u8, @splat('c')) ++ "\n" });
 
     try testing.expectError(
         error.CorruptObject,

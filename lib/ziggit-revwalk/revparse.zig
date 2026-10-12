@@ -152,7 +152,7 @@ pub fn peel(gpa: Allocator, repo: *Repository, oid: Oid, kind: ObjectKind) Error
 
 const testing = std.testing;
 
-const dummy_tree_hex = "4" ** 40;
+const dummy_tree_hex = &@as([40]u8, @splat('4'));
 const identity_line = "A U Thor <author@example.com> 1700000000 +0000";
 
 fn buildMinimalRepo(io: std.Io, dir: std.Io.Dir) !void {

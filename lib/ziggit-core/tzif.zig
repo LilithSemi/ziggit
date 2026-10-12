@@ -218,9 +218,9 @@ fn minutesFromOffsetSeconds(offset_seconds: i32) Error!i16 {
 /// one hour DST offset.
 const one_transition_tzif =
     // header: magic "TZif", version 0 (legacy), 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ @as([15]u8, @splat(0)) ++
     // counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=1, typecnt=2, charcnt=4
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++ [_]u8{ 0, 0, 0, 4 } ++
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++ [_]u8{ 0, 0, 0, 4 } ++
     // transition: ts = 1000
     [_]u8{ 0, 0, 0x03, 0xE8 } ++
     // that transition's timetype index: 1
@@ -236,9 +236,9 @@ const one_transition_tzif =
 /// is not a whole number of minutes.
 const no_transition_odd_offset_tzif =
     // header: magic "TZif", version 0 (legacy), 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ @as([15]u8, @splat(0)) ++
     // counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=0, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
     // timetype 0: offset 37s, not DST, designator index 0 ("A")
     [_]u8{ 0, 0, 0, 0x25, 0, 0 } ++
     // designators: "A\0"
@@ -250,9 +250,9 @@ const no_transition_odd_offset_tzif =
 /// could ever hold.
 const hostile_timecnt_tzif =
     // header: magic "TZif", version 0 (legacy), 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', 0 } ++ @as([15]u8, @splat(0)) ++
     // counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=0xFFFFFFFF, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 };
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 };
 
 /// A minimal, genuinely valid version 2 file: an empty legacy block
 /// (RFC 8536 ยง3.1) followed by a modern block (ยง3.2) with one transition,
@@ -260,17 +260,17 @@ const hostile_timecnt_tzif =
 /// footer.
 const version2_tzif =
     // legacy header: magic "TZif", version '2', 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ @as([15]u8, @splat(0)) ++
     // legacy counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=0, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
     // legacy timetype 0: offset 0s, not DST, designator index 0 ("A")
     [_]u8{ 0, 0, 0, 0, 0, 0 } ++
     // legacy designators: "A\0"
     [_]u8{ 'A', 0 } ++
     // modern header: magic "TZif", version '2', 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ @as([15]u8, @splat(0)) ++
     // modern counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=1, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
     // modern transition: ts = 2000 (8 byte timestamp)
     [_]u8{ 0, 0, 0, 0, 0, 0, 0x07, 0xD0 } ++
     // that transition's timetype index: 0
@@ -289,17 +289,17 @@ const version2_tzif =
 /// instead of the first, to prove the bound holds for both.
 const hostile_modern_timecnt_tzif =
     // legacy header: magic "TZif", version '2', 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ @as([15]u8, @splat(0)) ++
     // legacy counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=0, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 } ++
     // legacy timetype 0: offset 0s, not DST, designator index 0 ("A")
     [_]u8{ 0, 0, 0, 0, 0, 0 } ++
     // legacy designators: "A\0"
     [_]u8{ 'A', 0 } ++
     // modern header: magic "TZif", version '2', 15 reserved bytes
-    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ [_]u8{0} ** 15 ++
+    [_]u8{ 'T', 'Z', 'i', 'f', '2' } ++ @as([15]u8, @splat(0)) ++
     // modern counts: isutcnt=0, isstdcnt=0, leapcnt=0, timecnt=0xFFFFFFFF, typecnt=1, charcnt=2
-    [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{0} ** 4 ++ [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 };
+    @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ @as([4]u8, @splat(0)) ++ [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF } ++ [_]u8{ 0, 0, 0, 1 } ++ [_]u8{ 0, 0, 0, 2 };
 
 // zig fmt: on
 

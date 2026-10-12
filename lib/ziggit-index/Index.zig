@@ -310,7 +310,7 @@ fn readEntry(gpa: Allocator, r: *std.Io.Reader, f: Format, version: u32) Error!E
     }
 
     const stage_bits: u2 = @intCast((flags & Index.stage_mask) >> Index.stage_shift);
-    const stage: Stage = @enumFromInt(stage_bits);
+    const stage: Stage = @fromBackingInt(@intCast(stage_bits));
 
     const declared_len = flags & Index.name_len_mask;
     var path: []u8 = undefined;
@@ -642,7 +642,7 @@ test "open rejects a path length that runs past the end of the file" {
     try w.writeInt(u32, 0, .big); // uid
     try w.writeInt(u32, 0, .big); // gid
     try w.writeInt(u32, 0, .big); // size
-    try w.writeAll(&([_]u8{0x11} ** 20)); // oid
+    try w.writeAll(&@as([20]u8, @splat(0x11))); // oid
     try w.writeInt(u16, 100, .big); // flags: name length 100, stage 0
     try w.writeAll("abcdefghij"); // 10 bytes, nowhere near 100, no NUL
 
@@ -865,7 +865,7 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
         fn lessThan(_: void, lhs: Entry, rhs: Entry) bool {
             const cmp = std.mem.order(u8, lhs.path, rhs.path);
             if (cmp == .eq) {
-                return @intFromEnum(lhs.stage) < @intFromEnum(rhs.stage);
+                return @backingInt(lhs.stage) < @backingInt(rhs.stage);
             }
             return cmp == .lt;
         }
@@ -879,7 +879,7 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
         w.writeInt(u32, entry.stat.mtime_nanoseconds, .big) catch return error.IoFailed;
         w.writeInt(u32, entry.stat.dev, .big) catch return error.IoFailed;
         w.writeInt(u32, entry.stat.ino, .big) catch return error.IoFailed;
-        w.writeInt(u32, @intFromEnum(entry.mode), .big) catch return error.IoFailed;
+        w.writeInt(u32, @backingInt(entry.mode), .big) catch return error.IoFailed;
         w.writeInt(u32, entry.stat.uid, .big) catch return error.IoFailed;
         w.writeInt(u32, entry.stat.gid, .big) catch return error.IoFailed;
         w.writeInt(u32, entry.size, .big) catch return error.IoFailed;
@@ -892,7 +892,7 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
         w.writeAll(oid_bytes_ptr[0..oid_len]) catch return error.IoFailed;
 
         // Flags: stage bits (12-13), name length bits (0-11).
-        const stage_bits: u16 = @intCast(@intFromEnum(entry.stage));
+        const stage_bits: u16 = @intCast(@backingInt(entry.stage));
         const name_len = entry.path.len;
         const name_len_field: u16 = if (name_len >= Index.name_len_overflow)
             Index.name_len_overflow
@@ -910,7 +910,7 @@ pub fn write(i: Index, io: std.Io, git_dir: std.Io.Dir, f: Format) Error!void {
         const padded = std.mem.alignForward(u64, consumed, 8);
         const pad = padded - consumed;
         if (pad > 0) {
-            const pad_bytes: [7]u8 = [_]u8{0} ** 7;
+            const pad_bytes: [7]u8 = @splat(0);
             w.writeAll(pad_bytes[0..pad]) catch return error.IoFailed;
         }
     }
@@ -1091,7 +1091,7 @@ fn walkDirectory(
                 const oid = try odb.write(.blob, content, null);
 
                 // Determine file mode based on permissions
-                const mode: FileMode = if (@intFromEnum(stat.permissions) & 0o111 != 0)
+                const mode: FileMode = if (@backingInt(stat.permissions) & 0o111 != 0)
                     .blob_executable
                 else
                     .blob;
@@ -1338,7 +1338,7 @@ fn stagingFixture(io: std.Io, dir: std.Io.Dir) !void {
     try dir.writeFile(io, .{ .sub_path = "run.sh", .data = "#!/bin/sh\n" });
     var f = try dir.openFile(io, "run.sh", .{});
     defer f.close(io);
-    try f.setPermissions(io, @enumFromInt(0o755));
+    try f.setPermissions(io, @fromBackingInt(@intCast(0o755)));
 }
 
 /// The object database lives OUTSIDE the staged worktree, as a real

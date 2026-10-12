@@ -1,11 +1,11 @@
 .{
     .name = .ziggit,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zurl = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#7a8bf3eb8c4bb79055d2a9e542ff7a4ee7dd312b",
-            .hash = "zurl-0.1.0-eM4POUvdjQAHq6dr8DVoEDuoFf8clw4PKl5Qq9bHalwO",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#a4b62ad81aad0d42889e47d24cf77cfd9fa35436",
+            .hash = "zurl-0.1.0-eM4POf0ujgBvXVka8jLwtJYm-Gv65fYTm5Umx959K71d",
         },
     },
     .paths = .{""},

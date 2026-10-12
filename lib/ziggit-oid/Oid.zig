@@ -61,8 +61,8 @@ pub const Oid = union(Format) {
     /// The all-zero id for `f`. Git uses this to mean "no object".
     pub fn zero(f: Format) Oid {
         return switch (f) {
-            .sha1 => .{ .sha1 = [_]u8{0} ** 20 },
-            .sha256 => .{ .sha256 = [_]u8{0} ** 32 },
+            .sha1 => .{ .sha1 = @splat(0) },
+            .sha256 => .{ .sha256 = @splat(0) },
         };
     }
 
@@ -208,7 +208,7 @@ test "parseAny picks sha1 for 40 characters and sha256 for 64" {
 }
 
 test "fromBytes then slice returns the same bytes" {
-    const bytes = [_]u8{0xab} ** 20;
+    const bytes: [20]u8 = @splat(0xab);
     const oid = Oid.fromBytes(.sha1, &bytes);
     try std.testing.expectEqualSlices(u8, &bytes, oid.slice());
 }
@@ -242,8 +242,8 @@ test "parseAny rejects a length that is neither 40 nor 64" {
 }
 
 test "eql is false for a sha1 and a sha256 holding the same leading bytes" {
-    const bytes20 = [_]u8{0xaa} ** 20;
-    const bytes32 = [_]u8{0xaa} ** 32;
+    const bytes20: [20]u8 = @splat(0xaa);
+    const bytes32: [32]u8 = @splat(0xaa);
     const sha1_oid = Oid.fromBytes(.sha1, &bytes20);
     const sha256_oid = Oid.fromBytes(.sha256, &bytes32);
     try std.testing.expect(!sha1_oid.eql(sha256_oid));
@@ -252,7 +252,7 @@ test "eql is false for a sha1 and a sha256 holding the same leading bytes" {
 test "zero is all zero bytes and isZero agrees" {
     const oid = Oid.zero(.sha256);
     try std.testing.expect(oid.isZero());
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), oid.slice());
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), oid.slice());
 }
 
 test "hasPrefix accepts an odd length prefix" {
