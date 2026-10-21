@@ -4,8 +4,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zurl = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#a4b62ad81aad0d42889e47d24cf77cfd9fa35436",
-            .hash = "zurl-0.1.0-eM4POf0ujgBvXVka8jLwtJYm-Gv65fYTm5Umx959K71d",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/zurl#ef87f7ca04561d8587fd51a778ddb2bc09618ae9",
+            .hash = "zurl-0.1.0-eM4POUgfkADfHt2x-kOKhy8Cuq6TPv_ANKZSxM1VPYRR",
         },
     },
     .paths = .{""},

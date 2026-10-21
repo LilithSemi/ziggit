@@ -50,7 +50,7 @@
       treefmtEval = forAllSystems ({ pkgs, ... }: treefmt-nix.lib.evalModule pkgs (import ./treefmt.nix));
     in
     {
-      versionTemplate = "1.1pre-<lastModifiedDate>-<rev>";
+      versionTemplate = "0.1.0pre-<lastModifiedDate>-<rev>";
 
       devShells = forAllSystems (
         { pkgs, ... }:
@@ -78,7 +78,7 @@
 
             zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-EAMsH4tBy/Vmi6fMifHlig6KLpRKac9NVlp0hn0mpI8=";
+              hash = "sha256-Kp/mn+c0yQoJCUPt3F1qMNx5pZuInaEQrsgfkoZP6iM=";
             };
 
             nativeBuildInputs = with pkgs; [
