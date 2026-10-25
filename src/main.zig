@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "diff", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -74,7 +74,7 @@ fn isKnownCommand(cmd: []const u8) bool {
 
 fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     if (args.len == 0) {
-        try stderr.writeAll("usage: ziggit <cat-file|ls-tree|ls-remote|rev-parse|show-ref> ...\n");
+        try stderr.writeAll("usage: ziggit <cat-file|diff|ls-tree|ls-remote|rev-parse|show-ref> ...\n");
         return error.UsageError;
     }
 
@@ -123,6 +123,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
     const rest = args[1..];
     if (std.mem.eql(u8, cmd, "cat-file")) {
         try catFile(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "diff")) {
+        try diffCmd(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "ls-tree")) {
         try lsTree(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "rev-parse")) {
@@ -140,6 +142,39 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         // allows is handled here.
         unreachable;
     }
+}
+
+/// `ziggit diff <old> <new>` compares two tree-ish revisions through the
+/// same structured API available to library consumers. This intentionally
+/// starts with Git's uncoloured patch form; presentation belongs to a caller
+/// such as Chock, which can consume `Diff`/`Patch`/`Hunk` directly.
+fn diffCmd(
+    gpa: Allocator,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    if (args.len != 2) {
+        try stderr.writeAll("usage: ziggit diff <old> <new>\n");
+        return error.UsageError;
+    }
+
+    var diag: ?Diagnostic = null;
+    const old_tree = resolveTreeish(gpa, repo, args[0], &diag) catch |err| {
+        try reportDiag(gpa, stderr, "diff", err, &diag, args[0]);
+        return err;
+    };
+    const new_tree = resolveTreeish(gpa, repo, args[1], &diag) catch |err| {
+        try reportDiag(gpa, stderr, "diff", err, &diag, args[1]);
+        return err;
+    };
+    var result = ziggit.diffTrees(gpa, &repo.odb, old_tree, new_tree, .{}, &diag) catch |err| {
+        try reportDiag(gpa, stderr, "diff", err, &diag, null);
+        return err;
+    };
+    defer result.deinit(gpa);
+    try result.writeUnified(stdout);
 }
 
 /// Writes `ziggit: <context>: <error name>[: <path>][: <detail>]\n` to

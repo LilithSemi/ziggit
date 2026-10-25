@@ -259,6 +259,22 @@ pub fn build(b: *std.Build) void {
     });
     addModuleTests(b, test_step, status);
 
+    // Structured tree and commit diffs. The result is data (patches, hunks,
+    // and lines) so a UI need not parse unified text; unified rendering is a
+    // convenience layered over that same representation.
+    const diff = b.addModule("ziggit-diff", .{
+        .root_source_file = b.path("lib/ziggit-diff.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-object", .module = object },
+            .{ .name = "ziggit-odb", .module = odb },
+        },
+    });
+    addModuleTests(b, test_step, diff);
+
     // The top of the core: repository discovery, the on-disk layout, and
     // the `Repository` that ties the object database, the ref store, and
     // config into one thing. This is the one module that knows how the
@@ -385,6 +401,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-submodule", submodule);
     ziggit.addImport("ziggit-ignore", ignore);
     ziggit.addImport("ziggit-status", status);
+    ziggit.addImport("ziggit-diff", diff);
     ziggit.addImport("ziggit-worktree", worktree);
     addModuleTests(b, test_step, ziggit);
 

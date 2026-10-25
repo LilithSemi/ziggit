@@ -98,6 +98,19 @@ pub const StatusResult = @import("ziggit-status").Result;
 pub const StatusChange = @import("ziggit-status").Change;
 pub const StatusOptions = @import("ziggit-status").Options;
 
+// Structured changes between blobs, trees, or commits. A caller rendering a
+// review can consume hunks directly or ask the result to write unified text.
+pub const diffBlobs = @import("ziggit-diff").diffBlobs;
+pub const diffTrees = @import("ziggit-diff").diffTrees;
+pub const diffCommits = @import("ziggit-diff").diffCommits;
+pub const Diff = @import("ziggit-diff").Diff;
+pub const Patch = @import("ziggit-diff").Patch;
+pub const Hunk = @import("ziggit-diff").Hunk;
+pub const DiffLine = @import("ziggit-diff").Line;
+pub const DiffOrigin = @import("ziggit-diff").Origin;
+pub const DiffStatus = @import("ziggit-diff").Status;
+pub const DiffOptions = @import("ziggit-diff").Options;
+
 // Linked worktrees. Reading one already works through `Repository`; these
 // create and remove them.
 pub const worktreeAdd = @import("ziggit-worktree").add;
@@ -125,6 +138,7 @@ test {
     _ = @import("ziggit-revwalk");
     _ = @import("ziggit-fetch");
     _ = @import("ziggit-submodule");
+    _ = @import("ziggit-diff");
 }
 
 // A function is not a type: `discover` being exported gives a consumer no
@@ -165,6 +179,13 @@ const SurfaceCheck = struct {
     pub fn takesRefOutcome(_: RefOutcome) void {}
     pub fn takesSubmodule(_: *Submodule) void {}
     pub fn takesUpdateOptions(_: UpdateOptions) void {}
+    pub fn takesDiff(_: *Diff) void {}
+    pub fn takesPatch(_: *Patch) void {}
+    pub fn takesHunk(_: *Hunk) void {}
+    pub fn takesDiffLine(_: DiffLine) void {}
+    pub fn takesDiffOrigin(_: DiffOrigin) void {}
+    pub fn takesDiffStatus(_: DiffStatus) void {}
+    pub fn takesDiffOptions(_: DiffOptions) void {}
 };
 
 test "the front package's re-exports are usable as types in a signature" {
