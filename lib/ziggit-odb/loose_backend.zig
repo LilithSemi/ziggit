@@ -295,11 +295,15 @@ test "exists reports a real fault as IoFailed, never folded into false" {
     const oid = Oid.zero(.sha1);
     var hex_buf: [Oid.max_formatted_length]u8 = undefined;
     const hex = oid.toHex(&hex_buf);
-    // A plain file sits where the object's own fanout directory needs to
-    // be, so the stat this needs fails with a real fault, not
-    // `error.FileNotFound`: exactly the case a caller like `Odb.write`
-    // must not read as "the object is absent, writing is safe".
-    try tmp.dir.writeFile(io, .{ .sub_path = hex[0..2], .data = "not a directory" });
+    // An unreadable fanout directory makes the object's own path impossible
+    // to inspect. This produces AccessDenied on both Linux and Darwin; a
+    // plain file in this position is not portable because Darwin reports a
+    // nested stat through it as FileNotFound while Linux reports NotDir.
+    try tmp.dir.createDirPath(io, hex[0..2]);
+    var fanout = try tmp.dir.openDir(io, hex[0..2], .{ .iterate = true });
+    defer fanout.close(io);
+    try fanout.setPermissions(io, @fromBackingInt(@intCast(0)));
+    defer fanout.setPermissions(io, @fromBackingInt(@intCast(0o700))) catch {};
 
     try std.testing.expectError(error.IoFailed, exists(tmp.dir, io, oid));
 }

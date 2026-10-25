@@ -675,7 +675,10 @@ test "a redirect to a different host re-invokes the credential callback" {
     const gpa = testing.allocator;
 
     var target_server: TestServer = undefined;
-    try target_server.startOn("127.0.0.2", &.{
+    // `localhost` and `127.0.0.1` are different host names but reach the
+    // same loopback interface. Darwin configures only 127.0.0.1, unlike
+    // Linux where all of 127/8 can be bound.
+    try target_server.start(&.{
         "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         okResponse(advertisement_body),
     });
@@ -683,7 +686,7 @@ test "a redirect to a different host re-invokes the credential callback" {
 
     const location = try std.fmt.allocPrint(
         gpa,
-        "http://127.0.0.2:{d}/info/refs?service=git-upload-pack",
+        "http://localhost:{d}/info/refs?service=git-upload-pack",
         .{target_server.port()},
     );
     defer gpa.free(location);
@@ -718,7 +721,7 @@ test "a redirect to a different host re-invokes the credential callback" {
     var caps = try h.transport().capabilities(gpa, null);
     defer caps.deinit(gpa);
 
-    try testing.expectEqualStrings("127.0.0.2", SeenHost.buf[0..SeenHost.len]);
+    try testing.expectEqualStrings("localhost", SeenHost.buf[0..SeenHost.len]);
 }
 
 test "a credential already attached to one host is not forwarded to a redirect target that challenges again" {
@@ -730,7 +733,7 @@ test "a credential already attached to one host is not forwarded to a redirect t
     // then redirects to a different host. That host must see none of the
     // origin's credential, and its own challenge must reach the callback.
     var target_server: TestServer = undefined;
-    try target_server.startOn("127.0.0.2", &.{
+    try target_server.start(&.{
         "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         okResponse(advertisement_body),
     });
@@ -738,7 +741,7 @@ test "a credential already attached to one host is not forwarded to a redirect t
 
     const location = try std.fmt.allocPrint(
         gpa,
-        "http://127.0.0.2:{d}/info/refs?service=git-upload-pack",
+        "http://localhost:{d}/info/refs?service=git-upload-pack",
         .{target_server.port()},
     );
     defer gpa.free(location);
@@ -793,7 +796,7 @@ test "a credential already attached to one host is not forwarded to a redirect t
 
     try testing.expectEqual(@as(usize, 2), Calls.count);
     try testing.expectEqualStrings("127.0.0.1", Calls.hosts[0][0..Calls.host_lens[0]]);
-    try testing.expectEqualStrings("127.0.0.2", Calls.hosts[1][0..Calls.host_lens[1]]);
+    try testing.expectEqualStrings("localhost", Calls.hosts[1][0..Calls.host_lens[1]]);
 
     // The request that reached the second host, carrying nothing the
     // first host's credential could have supplied.
@@ -1025,13 +1028,13 @@ test "a redirect target longer than the retry buffer is ProtocolError, not trunc
 
     // The target server returns 401 so performWithAuth checks the effective URL.
     var target_server: TestServer = undefined;
-    try target_server.startOn("127.0.0.2", &.{
+    try target_server.start(&.{
         "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     });
     defer target_server.stop();
 
     var location_buf: [retry_url_len_max + 256]u8 = undefined;
-    const location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.2:{d}/{s}", .{
+    const location = try std.fmt.bufPrint(&location_buf, "http://localhost:{d}/{s}", .{
         target_server.port(),
         &@as([retry_url_len_max + 100]u8, @splat('x')),
     });
@@ -1063,7 +1066,7 @@ test "a challenged host longer than the buffer is ProtocolError, not truncated" 
     const long_host = try std.fmt.bufPrint(&host_buf, "{s}.example.com", .{host_part});
 
     var target_server: TestServer = undefined;
-    try target_server.startOn("127.0.0.2", &.{
+    try target_server.start(&.{
         "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     });
     defer target_server.stop();
