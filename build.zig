@@ -274,7 +274,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     addModuleTests(b, test_step, diff);
-
     // The top of the core: repository discovery, the on-disk layout, and
     // the `Repository` that ties the object database, the ref store, and
     // config into one thing. This is the one module that knows how the
@@ -311,6 +310,25 @@ pub fn build(b: *std.Build) void {
         },
     });
     addModuleTests(b, test_step, revwalk);
+
+    // Three-way merge: the file-level text merge, the tree walk over base,
+    // ours and theirs, and the virtual base a criss-cross history needs.
+    const merge = b.addModule("ziggit-merge", .{
+        .root_source_file = b.path("lib/ziggit-merge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-object", .module = object },
+            .{ .name = "ziggit-odb", .module = odb },
+            .{ .name = "ziggit-index", .module = index },
+            .{ .name = "ziggit-diff", .module = diff },
+            .{ .name = "ziggit-repo", .module = repo },
+            .{ .name = "ziggit-revwalk", .module = revwalk },
+        },
+    });
+    addModuleTests(b, test_step, merge);
 
     // Fetch: the remote strategy. Refspec matching, protocol v2
     // negotiation, receiving a packfile, and updating refs, tied into
@@ -370,6 +388,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ziggit-oid", .module = oid },
             .{ .name = "ziggit-core", .module = core },
             .{ .name = "ziggit-object", .module = object },
+            .{ .name = "ziggit-refs", .module = refs },
             .{ .name = "ziggit-repo", .module = repo },
             .{ .name = "ziggit-odb", .module = odb },
             .{ .name = "ziggit-checkout", .module = checkout },
