@@ -836,8 +836,6 @@ test "the server's stderr is captured and not mixed into the protocol stream" {
     try testing.expect(std.mem.indexOf(u8, diag.?.detail.?, "remote: warning about something") != null);
 }
 
-// suspicious
-
 test "a host key that is not ed25519 is UnsupportedKeyType, not a handshake failure" {
     const gpa = testing.allocator;
     var server: zurl_ssh.test_server = undefined;

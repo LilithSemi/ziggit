@@ -213,8 +213,6 @@ test "fromBytes then slice returns the same bytes" {
     try std.testing.expectEqualSlices(u8, &bytes, oid.slice());
 }
 
-// suspicious
-
 test "parse rejects uppercase hex" {
     try std.testing.expectError(
         error.InvalidOid,

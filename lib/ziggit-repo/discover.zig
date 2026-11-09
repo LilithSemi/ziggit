@@ -459,8 +459,6 @@ test "discover reads commondir for a linked worktree" {
     try std.testing.expectEqualStrings("common", content);
 }
 
-// suspicious
-
 /// A `std.Io` that behaves exactly like `std.testing.io`, except opening
 /// `".."` from one specific, pre-recorded directory returns a fresh handle
 /// to that same directory instead of its real parent. This simulates

@@ -321,8 +321,6 @@ test "offsetFromTzif reads a version 2 file's modern block" {
     try std.testing.expectEqual(@as(i16, 30), minutes);
 }
 
-// suspicious
-
 test "offsetFromTzif rejects an offset that is not a whole number of minutes" {
     var reader: std.Io.Reader = .fixed(&no_transition_odd_offset_tzif);
     try std.testing.expectError(error.NonWholeMinuteOffset, offsetFromTzif(std.testing.allocator, &reader, 0));

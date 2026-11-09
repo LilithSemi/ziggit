@@ -646,8 +646,6 @@ test "subsectionIterator finds nothing under a section with no subsections" {
     try std.testing.expect((try it.next()) == null);
 }
 
-// suspicious
-
 test "section names compare case insensitively" {
     const gpa = std.testing.allocator;
     var c = Config.init(gpa);

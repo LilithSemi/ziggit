@@ -88,8 +88,6 @@ test "report stores the diagnostic when the caller asked for one" {
     slot.?.deinit(gpa);
 }
 
-// suspicious
-
 test "report frees the diagnostic immediately when the caller declined" {
     const gpa = std.testing.allocator;
     const path = try gpa.dupe(u8, "refs/heads/bad");

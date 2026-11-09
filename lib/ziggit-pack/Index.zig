@@ -334,8 +334,6 @@ test "Index writes and reads back a stored crc32" {
     try std.testing.expectEqual(@as(u32, 0x33333333), idx.crc32At(2));
 }
 
-// suspicious
-
 test "Index open rejects a v1 index" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

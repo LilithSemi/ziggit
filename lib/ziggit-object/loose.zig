@@ -282,8 +282,6 @@ test "Header write then read round trips" {
     try std.testing.expectEqual(h.size, read_back.size);
 }
 
-// suspicious
-
 test "Header read rejects a size with a leading zero" {
     var r: std.Io.Reader = .fixed("blob 06\x00");
     try std.testing.expectError(error.CorruptObjectHeader, Header.read(&r));

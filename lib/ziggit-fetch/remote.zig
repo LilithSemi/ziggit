@@ -201,8 +201,6 @@ test "buildPlan names the mapped local destination for each update" {
     try testing.expect(plan.updates[0].force);
 }
 
-// suspicious
-
 test "buildPlan reports RefNotFound when a literal refspec's source is absent from the listing" {
     const gpa = testing.allocator;
     var rs = [_]Refspec{try Refspec.parse(gpa, "refs/heads/gone:refs/remotes/origin/gone")};

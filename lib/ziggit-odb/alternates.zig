@@ -224,8 +224,6 @@ test "resolve follows a relative path in an alternates file to a sibling directo
     try std.testing.expectEqualStrings("hi", content);
 }
 
-// suspicious
-
 test "an alternates file naming its own directory fails with AlternatesCycle" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

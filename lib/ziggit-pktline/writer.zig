@@ -82,8 +82,6 @@ test "writeLine appends the newline git's command lines carry" {
     try std.testing.expectEqualSlices(u8, "hello\n", packet.data);
 }
 
-// suspicious
-
 test "write rejects data longer than max_data_length" {
     var buffer: [Packet.max_data_length + 4]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);

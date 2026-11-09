@@ -56,8 +56,6 @@ test "refname accepts a single component HEAD" {
     try std.testing.expect(refname.isValid("HEAD"));
 }
 
-// suspicious
-
 test "refname rejects a name ending in .lock" {
     try std.testing.expectError(error.InvalidRefName, refname.validate("refs/heads/branch.lock"));
 }

@@ -150,8 +150,6 @@ test "Tag write reproduces the exact bytes it parsed" {
     try std.testing.expectEqualStrings(tag_bytes, w.buffered());
 }
 
-// suspicious
-
 test "Tag parse accepts a tag with no tagger" {
     const gpa = std.testing.allocator;
     const bytes =

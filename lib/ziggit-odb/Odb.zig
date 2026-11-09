@@ -494,8 +494,6 @@ test "refreshPacks picks up a pack added after init" {
     try std.testing.expect(try odb.exists(oid));
 }
 
-// suspicious
-
 test "write respects object_directory and leaves the repository objects dir untouched" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

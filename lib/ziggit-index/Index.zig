@@ -585,8 +585,6 @@ test "open reads a version 3 index" {
     })));
 }
 
-// suspicious
-
 test "open refuses a version 4 index rather than misreading it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

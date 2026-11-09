@@ -224,8 +224,6 @@ test "Sideband calls the progress sink with band two text" {
     try std.testing.expectEqualStrings(band2_progress_text, state.last[0..state.last_len]);
 }
 
-// suspicious
-
 test "Sideband turns a band three message into RemoteError" {
     var r: std.Io.Reader = .fixed(band3_error_packet_vector);
     var pktbuf: [pktline_mod.Packet.max_data_length]u8 = undefined;

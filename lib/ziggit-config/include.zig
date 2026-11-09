@@ -177,8 +177,6 @@ test "includeIf gitdir matches with a trailing slash meaning any depth" {
     try std.testing.expect(!gitdirMatches("/home/ross/work/", "/home/ross/other"));
 }
 
-// suspicious
-
 test "includeIf gitdir without a trailing slash matches only exactly" {
     try std.testing.expect(gitdirMatches("/home/ross/work", "/home/ross/work"));
     try std.testing.expect(!gitdirMatches("/home/ross/work", "/home/ross/work/sub"));

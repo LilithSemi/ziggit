@@ -140,8 +140,6 @@ test "packed_refs write then Iterator round trips" {
     try std.testing.expect((try it.next()) == null);
 }
 
-// suspicious
-
 test "packed-refs parsing ignores a comment line that is not the header" {
     const content =
         "# pack-refs with: peeled fully-peeled sorted\n" ++

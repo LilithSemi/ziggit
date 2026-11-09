@@ -251,8 +251,6 @@ test "buildFanout finds both ids when two ids share a leading byte" {
     try std.testing.expectEqual(built.offsets[1], idx.offsetOf(id_b) orelse unreachable);
 }
 
-// suspicious
-
 test "writeIndex reports a write failure on out as IoFailed, not CorruptPack" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

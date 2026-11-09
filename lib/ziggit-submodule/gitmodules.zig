@@ -137,8 +137,6 @@ test "parseGitmodules reads several submodules" {
     try testing.expectEqualStrings("https://example.com/b.git", subs[1].url);
 }
 
-// suspicious
-
 test "a submodule section with no path is dropped rather than returned with an empty path" {
     const gpa = testing.allocator;
     const bytes = "[submodule \"noPath\"]\n\turl = https://example.com/x.git\n";

@@ -1274,8 +1274,6 @@ test "a depth of one sends a deepen line and records the shallow boundary" {
     try testing.expect(std.mem.indexOf(u8, shallow_content, new_oid.toHex(&hex_buf)) != null);
 }
 
-// suspicious
-
 test "a non-force refspec refuses a non-fast-forward update" {
     const gpa = testing.allocator;
     const io = testing.io;

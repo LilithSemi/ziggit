@@ -130,8 +130,6 @@ test "delta apply handles an insert instruction" {
     try expectApplied("", patch, "hello");
 }
 
-// suspicious
-
 test "delta apply rejects a copy that reads past the end of the base" {
     // base_size=2, result_size=5, copy(offset=0, size=5) from a 2 byte base.
     const patch = [_]u8{ 2, 5, 0x91, 0, 5 };

@@ -310,8 +310,6 @@ test "parse marks a bare key as bare with an empty value" {
     try std.testing.expectEqualStrings("", entries.items[0].value);
 }
 
-// suspicious
-
 test "parse lower cases the section and key but not the subsection" {
     const gpa = std.testing.allocator;
     var entries: std.ArrayList(Entry) = .empty;

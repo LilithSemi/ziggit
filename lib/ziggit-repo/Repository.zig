@@ -684,8 +684,6 @@ test "headBranch returns null for a detached HEAD" {
     try std.testing.expect(name == null);
 }
 
-// suspicious
-
 test "open refuses core.repositoryformatversion 2" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

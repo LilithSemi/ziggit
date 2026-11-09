@@ -125,8 +125,6 @@ test "refspec match maps refs/heads/main through a wildcard" {
     try testing.expectEqualStrings("refs/remotes/origin/main", dst.?);
 }
 
-// suspicious
-
 test "refspec parse rejects a spec with no source" {
     const gpa = testing.allocator;
     try testing.expectError(error.InvalidRefspec, Refspec.parse(gpa, ":refs/heads/main"));

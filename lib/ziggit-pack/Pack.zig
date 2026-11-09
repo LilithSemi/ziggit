@@ -1112,8 +1112,6 @@ test "readAt reconstructs an object stored as a ref delta" {
     try std.testing.expectEqualStrings("hello", out.buffered());
 }
 
-// suspicious
-
 test "Pack open rejects a version that is not 2" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

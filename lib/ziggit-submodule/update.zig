@@ -843,8 +843,6 @@ test "recursive false checks out the top level and does not recurse" {
     for (&refspecs_storage) |*r| r.deinit(gpa);
 }
 
-// suspicious
-
 test "a submodule path containing .. is InvalidSubmodulePath" {
     var refspecs_storage: [1]fetch_mod.Refspec = undefined;
     const gpa = testing.allocator;

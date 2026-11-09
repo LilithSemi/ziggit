@@ -992,8 +992,6 @@ test "iterate yields every ref under refs/heads/" {
     try std.testing.expectEqual(@as(usize, 2), seen);
 }
 
-// suspicious
-
 test "update with expected_old null fails when the ref already exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

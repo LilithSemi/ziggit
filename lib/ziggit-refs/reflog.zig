@@ -129,8 +129,6 @@ test "append writes a reflog line carrying the old id, the new id, and the messa
     try std.testing.expect(std.mem.endsWith(u8, content, "\tbranch: created from main\n"));
 }
 
-// suspicious
-
 test "a second append adds a new line without disturbing the first" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

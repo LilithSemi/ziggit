@@ -196,8 +196,6 @@ test "writeAtomic then read round trips" {
     try std.testing.expectEqualStrings("333333333333333333333333333333333333333c", target.oid.toHex(&buf));
 }
 
-// suspicious
-
 test "a loose ref file with trailing whitespace still parses" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

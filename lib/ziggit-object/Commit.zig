@@ -222,8 +222,6 @@ test "Commit write reproduces the exact bytes it parsed" {
     try std.testing.expectEqualStrings(plain_commit_bytes, w.buffered());
 }
 
-// suspicious
-
 test "Commit parse keeps a gpgsig header verbatim and write puts it back" {
     const gpa = std.testing.allocator;
     try expectHash(gpgsig_commit_bytes, gpgsig_commit_sha1);

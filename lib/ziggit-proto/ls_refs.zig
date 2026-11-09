@@ -177,8 +177,6 @@ test "writeLsRefs emits the prefixes it was given" {
     try std.testing.expect(std.mem.indexOf(u8, written, "peel") == null);
 }
 
-// suspicious
-
 test "readLsRefs rejects a line whose oid is not valid hex" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("002fnot-hex-at-all-not-hex-at-all refs/heads/x\n0000");

@@ -340,8 +340,6 @@ test "peel follows an annotated tag to its commit" {
     try testing.expect(peeled.eql(commit_oid));
 }
 
-// suspicious
-
 test "peel of a blob to a tree is NotThatKind" {
     const gpa = testing.allocator;
     const io = testing.io;

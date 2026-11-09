@@ -997,7 +997,6 @@ test "remove_untracked never deletes .git" {
     defer gpa.free(head_bytes);
     try std.testing.expectEqualStrings("ref: refs/heads/main\n", head_bytes);
 }
-// suspicious
 
 test "a blob with CRLF in it is written byte for byte, with no filtering" {
     const gpa = std.testing.allocator;

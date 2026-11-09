@@ -240,8 +240,6 @@ test "objectFormat defaults to sha1 when the server does not say" {
     try std.testing.expectEqual(Format.sha1, caps.objectFormat());
 }
 
-// suspicious
-
 test "parseCapabilities refuses a server that advertises only version 1" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("000eversion 1\n0000");

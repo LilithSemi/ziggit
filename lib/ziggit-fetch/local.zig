@@ -986,8 +986,6 @@ test "fetch dispatches an https url to the remote strategy" {
     }, null));
 }
 
-// suspicious
-
 test "fetchLocal on a path that is not a repository is NotFound" {
     const gpa = testing.allocator;
     const io = testing.io;

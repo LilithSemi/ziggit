@@ -110,8 +110,6 @@ test "read parses a data packet and returns its payload without the header" {
     try std.testing.expectEqualSlices(u8, "ab", packet.data);
 }
 
-// suspicious
-
 test "read rejects a length header that is not four hex digits" {
     var r: std.Io.Reader = .fixed("00ax");
     var buffer: [Packet.max_data_length]u8 = undefined;

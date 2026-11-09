@@ -207,8 +207,6 @@ test "Tree find returns the entry with the given name" {
     try std.testing.expect(found.oid.eql(try hexToOid(runsh_oid_hex)));
 }
 
-// suspicious
-
 test "Tree find returns null for a name not in the tree" {
     const gpa = std.testing.allocator;
     var buf: [256]u8 = undefined;

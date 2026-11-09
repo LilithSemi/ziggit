@@ -82,8 +82,6 @@ test "isTransient is true for NetworkFailed and false for AuthFailed" {
     try testing.expect(!isTransient(error.AuthFailed));
 }
 
-// suspicious
-
 test "a 404 is NotFound and is not transient" {
     try testing.expect(!isTransient(error.NotFound));
 }

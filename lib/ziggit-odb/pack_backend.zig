@@ -196,8 +196,6 @@ test "refreshPacks picks up a pack added after init" {
     try std.testing.expect(ps.exists(oid));
 }
 
-// suspicious
-
 test "PackSet stat resolves a plain packed object to its kind and size" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

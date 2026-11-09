@@ -605,8 +605,6 @@ test "a bearer credential reaches the Authorization header" {
     try testing.expect(Cb.saw_bearer_allowed);
 }
 
-// suspicious
-
 test "a 401 with no credential callback is AuthRequired" {
     const gpa = testing.allocator;
     var server: TestServer = undefined;

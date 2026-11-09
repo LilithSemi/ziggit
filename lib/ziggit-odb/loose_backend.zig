@@ -285,8 +285,6 @@ test "stat reports kind and size without a payload reader ever being touched" {
     try std.testing.expectEqual(@as(u64, 6), info.size);
 }
 
-// suspicious
-
 test "exists reports a real fault as IoFailed, never folded into false" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

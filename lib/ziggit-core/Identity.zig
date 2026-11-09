@@ -95,8 +95,6 @@ test "Identity write reproduces the exact bytes it parsed" {
     try std.testing.expectEqualStrings(line, w.buffered());
 }
 
-// suspicious
-
 test "Identity parse accepts a negative tz offset" {
     const id = try Identity.parse("A U Thor <author@example.com> 1234567890 -0430");
     try std.testing.expectEqual(@as(i16, -270), id.tz_offset_minutes);

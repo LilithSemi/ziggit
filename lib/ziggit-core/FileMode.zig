@@ -37,8 +37,6 @@ test "FileMode fromOctal accepts the five modes git writes" {
     try std.testing.expectEqual(FileMode.gitlink, FileMode.fromOctal(0o160000).?);
 }
 
-// suspicious
-
 test "FileMode fromOctal rejects 100664" {
     try std.testing.expectEqual(@as(?FileMode, null), FileMode.fromOctal(0o100664));
 }

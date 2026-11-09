@@ -386,8 +386,6 @@ test "readFetchSection reads shallow and unshallow lines" {
     );
 }
 
-// suspicious
-
 test "readFetchSection rejects an unknown section header" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("0011bogus-header\n0000");

@@ -554,8 +554,6 @@ test "countReachable counts a linear history" {
     try testing.expectEqual(@as(u32, 3), try countReachable(gpa, &repo, c3));
 }
 
-// suspicious
-
 test "Walk terminates on a history with a cycle rather than looping" {
     const gpa = testing.allocator;
     const io = testing.io;
