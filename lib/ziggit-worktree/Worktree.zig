@@ -137,6 +137,15 @@ pub fn add(
         ) catch return error.IoFailed;
     }
 
+    // Git copies the main repository's `config.worktree` into each new
+    // worktree, and the worktree then reads those settings. An absent file
+    // is the ordinary case, since it exists only with
+    // `extensions.worktreeConfig` set.
+    copyFile(gpa, io, repo.layout.common_dir, "config.worktree", admin) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.IoFailed,
+    };
+
     const tree = try revwalk_mod.peel(gpa, repo, commit, .tree);
     try checkout_mod.checkoutTree(gpa, io, &repo.odb, worktree_dir, tree, .{
         .write_index_to = if (options.write_index) admin else null,
@@ -886,6 +895,15 @@ fn nowSeconds(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
 }
 
+/// Copies `name` from `from` into `to`, keeping the bytes as they are.
+/// Reports `error.FileNotFound` so a caller can treat an absent source as
+/// nothing to do.
+fn copyFile(gpa: Allocator, io: std.Io, from: std.Io.Dir, name: []const u8, to: std.Io.Dir) !void {
+    const bytes = try from.readFileAlloc(io, name, gpa, .limited(1 << 20));
+    defer gpa.free(bytes);
+    try to.writeFile(io, .{ .sub_path = name, .data = bytes });
+}
+
 /// Like `Fixture.init`, with an identity so reflog writing is reachable.
 /// `Repository.open` takes its committer from `user.name` and `user.email`,
 /// which a bare `Repository.init` does not set.
@@ -964,4 +982,47 @@ test "remove refuses a locked worktree until force is doubled" {
     try remove(gpa, io, &fx.repo, "w", .{ .force = .locked }, null);
     try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
     try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
+}
+
+test "add copies config.worktree when the repository has one" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const body = "[core]\n\tsomeSetting = mainvalue\n";
+    try fx.repo.layout.common_dir.writeFile(io, .{ .sub_path = "config.worktree", .data = body });
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const copied = try fx.repo.layout.common_dir.readFileAlloc(io, "worktrees/w/config.worktree", gpa, .limited(4096));
+    defer gpa.free(copied);
+    try testing.expectEqualStrings(body, copied);
+}
+
+test "add succeeds when the repository has no config.worktree" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.statFile(io, "worktrees/w/config.worktree", .{}));
 }
