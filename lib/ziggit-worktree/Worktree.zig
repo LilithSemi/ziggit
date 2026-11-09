@@ -48,6 +48,9 @@ pub const Error = error{
     WorktreeNotFound,
     WorktreeNotEmpty,
     WorktreeDirty,
+    /// The worktree has a `locked` file. Git refuses to remove one even
+    /// with a single force, so `Force.locked` is what overrides this.
+    WorktreeLocked,
     IoFailed,
 } || repo_mod.Error || checkout_mod.Error || status_mod.Error || revwalk_mod.Error || Allocator.Error;
 
@@ -140,10 +143,21 @@ pub fn add(
     }, diag);
 }
 
+/// How far `remove` may go against a worktree that objects. Git spells
+/// these as no flag, `--force`, and `--force --force`: a plain `--force`
+/// still refuses a locked worktree, and only a doubled one removes it.
+pub const Force = enum {
+    /// Refuse a worktree with modified or untracked files, and refuse a
+    /// locked one.
+    none,
+    /// Remove a worktree whose files differ, but still refuse a locked one.
+    dirty,
+    /// Remove it whatever it says, lock included.
+    locked,
+};
+
 pub const RemoveOptions = struct {
-    /// Delete a worktree whose files differ from its index. Off by default,
-    /// matching git, which refuses and tells the caller to use force.
-    force: bool = false,
+    force: Force = .none,
 };
 
 /// Deletes the linked worktree `name`: its checked-out files and its
@@ -164,13 +178,26 @@ pub fn remove(
     var admin_open = true;
     defer if (admin_open) admin.close(io);
 
+    // Git refuses a locked worktree on `remove` and on `--force` alike,
+    // and takes only a doubled force. A lock is the `locked` file in the
+    // administrative directory; its contents are the reason, which may be
+    // empty.
+    if (options.force != .locked) {
+        if (admin.statFile(io, "locked", .{})) |_| {
+            return error.WorktreeLocked;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.IoFailed,
+        }
+    }
+
     const work_path = try readWorktreePath(gpa, io, admin);
     defer gpa.free(work_path);
 
     var work = std.Io.Dir.cwd().openDir(io, work_path, .{ .iterate = true }) catch null;
     if (work) |*w| {
         defer w.close(io);
-        if (!options.force) try requireClean(gpa, io, repo, w.*, admin, diag);
+        if (options.force == .none) try requireClean(gpa, io, repo, w.*, admin, diag);
     }
 
     if (work != null) {
@@ -667,7 +694,7 @@ test "remove refuses when worktree has a modified file and succeeds with force" 
 
     try testing.expectError(error.WorktreeDirty, remove(gpa, io, &fx.repo, "w", .{}, null));
 
-    try remove(gpa, io, &fx.repo, "w", .{ .force = true }, null);
+    try remove(gpa, io, &fx.repo, "w", .{ .force = .dirty }, null);
 
     try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
     try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
@@ -906,4 +933,35 @@ test "add writes the worktree's first HEAD reflog entry, with no message" {
     });
     defer gpa.free(prefix);
     try testing.expect(std.mem.startsWith(u8, log, prefix));
+}
+
+test "remove refuses a locked worktree until force is doubled" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    // Git's lock is this file. Its contents are the reason and may be empty.
+    try fx.repo.layout.common_dir.writeFile(io, .{ .sub_path = "worktrees/w/locked", .data = "" });
+
+    try testing.expectError(error.WorktreeLocked, remove(gpa, io, &fx.repo, "w", .{}, null));
+    try testing.expectError(error.WorktreeLocked, remove(gpa, io, &fx.repo, "w", .{ .force = .dirty }, null));
+
+    // Both refusals leave everything in place.
+    var still = try fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{});
+    still.close(io);
+
+    try remove(gpa, io, &fx.repo, "w", .{ .force = .locked }, null);
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
+    try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
 }

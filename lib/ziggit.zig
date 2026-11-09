@@ -117,6 +117,10 @@ pub const worktreeAdd = @import("ziggit-worktree").add;
 pub const worktreeRemove = @import("ziggit-worktree").remove;
 pub const WorktreeAddOptions = @import("ziggit-worktree").AddOptions;
 pub const WorktreeRemoveOptions = @import("ziggit-worktree").RemoveOptions;
+// How far `worktreeRemove` may go against a worktree that objects. Named
+// here rather than left reachable only through `WorktreeRemoveOptions`,
+// since a caller setting anything but the default has to name it.
+pub const WorktreeForce = @import("ziggit-worktree").Force;
 pub const worktreePrune = @import("ziggit-worktree").prune;
 pub const worktreeList = @import("ziggit-worktree").list;
 pub const worktreeFreeList = @import("ziggit-worktree").freeList;
@@ -206,6 +210,8 @@ const SurfaceCheck = struct {
     pub fn takesRefOutcome(_: RefOutcome) void {}
     pub fn takesSubmodule(_: *Submodule) void {}
     pub fn takesUpdateOptions(_: UpdateOptions) void {}
+    pub fn takesWorktreeForce(_: WorktreeForce) void {}
+    pub fn takesWorktreeRemoveOptions(_: WorktreeRemoveOptions) void {}
     pub fn takesDiff(_: *Diff) void {}
     pub fn takesPatch(_: *Patch) void {}
     pub fn takesHunk(_: *Hunk) void {}
