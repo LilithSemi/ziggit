@@ -63,8 +63,9 @@ pub const Patch = struct {
     new_mode: ?FileMode = null,
     old_oid: ?Oid = null,
     new_oid: ?Oid = null,
-    /// Rename/copy similarity percentage. Exact detection currently yields
-    /// 100; ordinary additions, deletions, and modifications use zero.
+    /// Rename/copy similarity percentage. Exact renames and copies use 100.
+    /// Inexact renames use the estimate from `similarityPercent`. Ordinary
+    /// additions, deletions, and modifications use zero.
     similarity: u8 = 0,
     /// Binary patches deliberately carry metadata but no text hunks.
     binary: bool = false,
@@ -238,6 +239,11 @@ pub const Options = struct {
     detect_renames: bool = true,
     /// Git enables renames by default but requires `--find-copies` for this.
     detect_copies: bool = false,
+    /// Minimum similarity percentage for an inexact rename. A pair at the
+    /// threshold is a rename.
+    rename_threshold: u8 = 50,
+    /// Inexact detection stops when the add/delete pair count exceeds this.
+    target_limit: usize = 200,
 };
 
 const Op = struct { origin: Origin, content: []const u8 };
@@ -437,7 +443,8 @@ fn makeHunks(gpa: Allocator, ops: []const Op, context: usize) Allocator.Error![]
 const TreeEntry = struct { path: []const u8, mode: FileMode, oid: Oid };
 
 /// Compares two trees. A null side is Git's empty tree. Exact-content
-/// renames and copies are recognized without reading a blob twice.
+/// renames come first, then similar pairs are scored as inexact renames.
+/// Exact copies are recognized when `detect_copies` is set.
 pub fn diffTrees(gpa: Allocator, odb: *Odb, old_tree: ?Oid, new_tree: ?Oid, options: Options, diag: ?*?Diagnostic) Error!Diff {
     var old: std.ArrayList(TreeEntry) = .empty;
     defer freeEntries(gpa, &old);
@@ -493,17 +500,31 @@ pub fn diffTrees(gpa: Allocator, odb: *Odb, old_tree: ?Oid, new_tree: ?Oid, opti
 
     // Exact renames consume a deletion and addition. Exact copies leave the
     // source available, because it still exists under its original name.
-    if (options.detect_renames) for (old.items, 0..) |a, ai| {
-        if (used_old[ai]) continue;
-        for (new.items, 0..) |b, bi| {
-            if (used_new[bi] or !a.oid.eql(b.oid) or modeKind(a.mode) != modeKind(b.mode)) continue;
-            const p = try metadataPatch(gpa, a.path, b.path, .renamed, a, b);
-            try appendPatch(gpa, &patches, p);
-            used_old[ai] = true;
-            used_new[bi] = true;
-            break;
+    //
+    // Driven from the destination, and preferring a source whose basename
+    // matches it. Two sources holding the same content are otherwise
+    // indistinguishable, and git picks the basename match: a destination
+    // `dirC/other.txt` pairs with `dirB/other.txt`, not with the earlier
+    // `dirA/thing.txt`.
+    if (options.detect_renames) for (new.items, 0..) |b, bi| {
+        if (used_new[bi]) continue;
+        var chosen: ?usize = null;
+        for (old.items, 0..) |a, ai| {
+            if (used_old[ai] or !a.oid.eql(b.oid) or modeKind(a.mode) != modeKind(b.mode)) continue;
+            if (sameBasename(a.path, b.path)) {
+                chosen = ai;
+                break;
+            }
+            if (chosen == null) chosen = ai;
         }
+        const ai = chosen orelse continue;
+        const a = old.items[ai];
+        const p = try metadataPatch(gpa, a.path, b.path, .renamed, a, b);
+        try appendPatch(gpa, &patches, p);
+        used_old[ai] = true;
+        used_new[bi] = true;
     };
+    if (options.detect_renames) try findInexactRenames(gpa, odb, old.items, new.items, used_old, used_new, options, &patches, diag);
     if (options.detect_copies) for (new.items, 0..) |b, bi| {
         if (used_new[bi]) continue;
         for (old.items) |a| {
@@ -539,6 +560,137 @@ pub fn diffTrees(gpa: Allocator, odb: *Odb, old_tree: ?Oid, new_tree: ?Oid, opti
         }
     }.lessThan);
     return .{ .patches = owned };
+}
+
+const RenamePair = struct { old: usize, new: usize, similarity: u8 };
+
+/// Matches each unmatched deletion with an unmatched addition by similarity.
+/// The highest scores win first, so each path joins at most one rename.
+fn findInexactRenames(
+    gpa: Allocator,
+    odb: *Odb,
+    old: []const TreeEntry,
+    new: []const TreeEntry,
+    used_old: []bool,
+    used_new: []bool,
+    options: Options,
+    patches: *std.ArrayList(Patch),
+    diag: ?*?Diagnostic,
+) Error!void {
+    // The count runs before any blob is read. A large pair count leaves
+    // every path unpaired, so the scoring stays bounded.
+    var sources: usize = 0;
+    for (old, used_old) |a, used| if (!used and modeKind(a.mode) != .gitlink) {
+        sources += 1;
+    };
+    var targets: usize = 0;
+    for (new, used_new) |b, used| if (!used and modeKind(b.mode) != .gitlink) {
+        targets += 1;
+    };
+    if (sources * targets > options.target_limit) return;
+
+    var pairs: std.ArrayList(RenamePair) = .empty;
+    defer pairs.deinit(gpa);
+    for (old, 0..) |a, ai| {
+        if (used_old[ai] or modeKind(a.mode) == .gitlink) continue;
+        for (new, 0..) |b, bi| {
+            if (used_new[bi] or modeKind(b.mode) != modeKind(a.mode)) continue;
+            const similarity = try scoreBlobs(gpa, odb, a.oid, b.oid, options, diag);
+            if (similarity < options.rename_threshold) continue;
+            try pairs.append(gpa, .{ .old = ai, .new = bi, .similarity = similarity });
+        }
+    }
+    std.mem.sort(RenamePair, pairs.items, PairOrder{ .old = old, .new = new }, renamePairLessThan);
+
+    for (pairs.items) |pair| {
+        if (used_old[pair.old] or used_new[pair.new]) continue;
+        // A pair too large for a line diff keeps its rename without hunks.
+        var p = patchEntries(gpa, odb, old[pair.old], new[pair.new], options, diag) catch |err| switch (err) {
+            error.DiffTooLarge, error.TooManyLines => try metadataPatch(gpa, old[pair.old].path, new[pair.new].path, .renamed, old[pair.old], new[pair.new]),
+            else => |e| return e,
+        };
+        p.status = .renamed;
+        p.similarity = pair.similarity;
+        try appendPatch(gpa, patches, p);
+        used_old[pair.old] = true;
+        used_new[pair.new] = true;
+    }
+}
+
+const PairOrder = struct { old: []const TreeEntry, new: []const TreeEntry };
+
+/// Git prefers a source whose basename matches the destination's when two
+/// sources score the same. Two identical sources moved to `dirC/other.txt`
+/// make git pick `dirB/other.txt` over the earlier `dirA/thing.txt`, so the
+/// preference beats path order rather than coinciding with it.
+///
+/// Git reaches this through a separate pass over same-basename candidates
+/// before it scores the rest, so a basename match can also beat a HIGHER
+/// score there. Here it only breaks a tie, which is why a tree with many
+/// simultaneous renames can still pair differently from git.
+fn renamePairLessThan(ctx: PairOrder, a: RenamePair, b: RenamePair) bool {
+    if (a.similarity != b.similarity) return a.similarity > b.similarity;
+
+    const a_match = sameBasename(ctx.old[a.old].path, ctx.new[a.new].path);
+    const b_match = sameBasename(ctx.old[b.old].path, ctx.new[b.new].path);
+    if (a_match != b_match) return a_match;
+
+    if (a.new != b.new) return a.new < b.new;
+    return a.old < b.old;
+}
+
+fn sameBasename(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, std.fs.path.basename(a), std.fs.path.basename(b));
+}
+
+fn scoreBlobs(gpa: Allocator, odb: *Odb, old_oid: Oid, new_oid: Oid, options: Options, diag: ?*?Diagnostic) Error!u8 {
+    const old_bytes = try odb.readAlloc(gpa, old_oid, options.max_blob_bytes, diag);
+    defer gpa.free(old_bytes);
+    const new_bytes = try odb.readAlloc(gpa, new_oid, options.max_blob_bytes, diag);
+    defer gpa.free(new_bytes);
+    return similarityPercent(gpa, old_bytes, new_bytes);
+}
+
+/// Estimates how much of `new` appears in `old`, as a percentage. Each span
+/// of `new` adds its byte length when an unused identical span exists in
+/// `old`. The sum is divided by the size of the larger file. Span order is ignored.
+fn similarityPercent(gpa: Allocator, old: []const u8, new: []const u8) Allocator.Error!u8 {
+    const max_size = @max(old.len, new.len);
+    if (max_size == 0) return 100;
+    var counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer counts.deinit(gpa);
+    var at: usize = 0;
+    while (at < old.len) {
+        const end = spanEnd(old, at);
+        const entry = try counts.getOrPut(gpa, old[at..end]);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+        at = end;
+    }
+    var copied: u64 = 0;
+    at = 0;
+    while (at < new.len) {
+        const end = spanEnd(new, at);
+        const line = new[at..end];
+        at = end;
+        const count = counts.getPtr(line) orelse continue;
+        if (count.* == 0) continue;
+        count.* -= 1;
+        copied += line.len;
+    }
+    // Git scales by 60000 before it reports a percentage. The same scale
+    // keeps the threshold test identical to Git's.
+    const score = copied * 60000 / @as(u64, max_size);
+    return @intCast(score * 100 / 60000);
+}
+
+/// Git splits long lines into spans of at most 64 bytes when it scores.
+const max_span_bytes = 64;
+
+fn spanEnd(bytes: []const u8, start: usize) usize {
+    const limit = @min(bytes.len, start + max_span_bytes);
+    const nl = std.mem.indexOfScalarPos(u8, bytes[0..limit], start, '\n') orelse return limit;
+    return nl + 1;
 }
 
 /// Reads two commit objects and compares the trees they name.
@@ -714,10 +866,337 @@ test "tree diffs expose additions modifications and exact renames" {
     try testing.expectEqualStrings("new.txt", result.patches[2].new_path);
 }
 
+fn initTestOdb(tmp: *testing.TmpDir, odb: *Odb) !void {
+    try tmp.dir.createDirPath(testing.io, "objects");
+    const objects = try tmp.dir.openDir(testing.io, "objects", .{ .iterate = true });
+    odb.* = try Odb.init(testing.allocator, testing.io, objects, .sha1, .{});
+}
+
+/// Returns `count` lines named `tag line N` for N from `from`. Caller frees.
+fn makeLines(gpa: Allocator, tag: u8, from: usize, count: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (from..from + count) |i| {
+        const line = try std.fmt.allocPrint(gpa, "{c} line {d}\n", .{ tag, i });
+        defer gpa.free(line);
+        try out.appendSlice(gpa, line);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "an inexact rename with a small edit is reported as renamed" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    const head = try makeLines(gpa, 'k', 0, 14);
+    defer gpa.free(head);
+    const tail = try makeLines(gpa, 'k', 15, 15);
+    defer gpa.free(tail);
+    const old_bytes = try std.mem.concat(gpa, u8, &.{ head, "k line 14\n", tail });
+    defer gpa.free(old_bytes);
+    const new_bytes = try std.mem.concat(gpa, u8, &.{ head, "edited line\n", tail });
+    defer gpa.free(new_bytes);
+
+    const old_blob = try odb.write(.blob, old_bytes, null);
+    const new_blob = try odb.write(.blob, new_bytes, null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), result.patches.len);
+    const patch = result.patches[0];
+    try testing.expectEqual(Status.renamed, patch.status);
+    try testing.expectEqualStrings("old.txt", patch.old_path);
+    try testing.expectEqualStrings("new.txt", patch.new_path);
+    try testing.expect(patch.similarity > 50 and patch.similarity < 100);
+    try testing.expect(patch.hunks.len > 0);
+}
+
+test "an inexact rename with a large edit stays an add and a delete" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    const kept = try makeLines(gpa, 'k', 0, 3);
+    defer gpa.free(kept);
+    const replaced = try makeLines(gpa, 'u', 0, 7);
+    defer gpa.free(replaced);
+    const old_bytes = try makeLines(gpa, 'k', 0, 10);
+    defer gpa.free(old_bytes);
+    const new_bytes = try std.mem.concat(gpa, u8, &.{ kept, replaced });
+    defer gpa.free(new_bytes);
+
+    const old_blob = try odb.write(.blob, old_bytes, null);
+    const new_blob = try odb.write(.blob, new_bytes, null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), result.patches.len);
+    try testing.expectEqual(Status.added, result.patches[0].status);
+    try testing.expectEqual(Status.deleted, result.patches[1].status);
+}
+
+test "an inexact rename at exactly the threshold is a rename" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    // Eleven shared bytes out of twenty-two gives exactly 50 percent.
+    const old_blob = try odb.write(.blob, "aaaaaaaaaa\nbbbbbbbbbb\n", null);
+    const new_blob = try odb.write(.blob, "aaaaaaaaaa\ncccccccccc\n", null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var at_threshold = try diffTrees(gpa, &odb, old_tree, new_tree, .{ .rename_threshold = 50 }, null);
+    defer at_threshold.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), at_threshold.patches.len);
+    try testing.expectEqual(Status.renamed, at_threshold.patches[0].status);
+    try testing.expectEqual(@as(u8, 50), at_threshold.patches[0].similarity);
+
+    var above_threshold = try diffTrees(gpa, &odb, old_tree, new_tree, .{ .rename_threshold = 51 }, null);
+    defer above_threshold.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), above_threshold.patches.len);
+}
+
+test "inexact detection aborts when the pair count exceeds target_limit" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    // Sixteen deletions and sixteen additions make 256 pairs, above the default limit of 200.
+    var old_names: [16][16]u8 = undefined;
+    var new_names: [16][16]u8 = undefined;
+    var old_entries: [16]Tree.Entry = undefined;
+    var new_entries: [16]Tree.Entry = undefined;
+    const head = try makeLines(gpa, 'k', 0, 14);
+    defer gpa.free(head);
+    const tail = try makeLines(gpa, 'k', 15, 15);
+    defer gpa.free(tail);
+    const kept = try std.mem.concat(gpa, u8, &.{ head, "k line 14\n", tail });
+    defer gpa.free(kept);
+    const moved = try std.mem.concat(gpa, u8, &.{ head, "edited line\n", tail });
+    defer gpa.free(moved);
+    old_entries[0] = .{ .mode = .blob, .name = "keep.txt", .oid = try odb.write(.blob, kept, null) };
+    new_entries[0] = .{ .mode = .blob, .name = "moved.txt", .oid = try odb.write(.blob, moved, null) };
+    for (1..16) |i| {
+        const unrelated = try makeLines(gpa, 'u', 100 * i, 5);
+        defer gpa.free(unrelated);
+        const old_name = try std.fmt.bufPrint(&old_names[i], "old{d}.txt", .{i});
+        const new_name = try std.fmt.bufPrint(&new_names[i], "new{d}.txt", .{i});
+        old_entries[i] = .{ .mode = .blob, .name = old_name, .oid = try odb.write(.blob, unrelated, null) };
+        const other = try makeLines(gpa, 'v', 100 * i, 5);
+        defer gpa.free(other);
+        new_entries[i] = .{ .mode = .blob, .name = new_name, .oid = try odb.write(.blob, other, null) };
+    }
+    const old_tree = try writeTestTree(&odb, &old_entries);
+    const new_tree = try writeTestTree(&odb, &new_entries);
+
+    var capped = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer capped.deinit(gpa);
+    try testing.expectEqual(@as(usize, 32), capped.patches.len);
+    for (capped.patches) |patch| try testing.expect(patch.status != .renamed);
+
+    var uncapped = try diffTrees(gpa, &odb, old_tree, new_tree, .{ .target_limit = 1000 }, null);
+    defer uncapped.deinit(gpa);
+    var renames: usize = 0;
+    for (uncapped.patches) |patch| if (patch.status == .renamed) {
+        renames += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), renames);
+}
+
+test "similarity scores long lines in 64 byte spans" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    // The first 64 bytes match. The line as a whole does not, so whole-line
+    // matching would score zero here. 64 of 102 bytes gives 62 percent.
+    const old_bytes = try gpa.alloc(u8, 101);
+    defer gpa.free(old_bytes);
+    @memset(old_bytes[0..100], 'a');
+    old_bytes[100] = '\n';
+    const new_bytes = try gpa.alloc(u8, 102);
+    defer gpa.free(new_bytes);
+    @memset(new_bytes[0..100], 'a');
+    new_bytes[100] = 'b';
+    new_bytes[101] = '\n';
+    const old_blob = try odb.write(.blob, old_bytes, null);
+    const new_blob = try odb.write(.blob, new_bytes, null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), result.patches.len);
+    try testing.expectEqual(Status.renamed, result.patches[0].status);
+    try testing.expectEqual(@as(u8, 62), result.patches[0].similarity);
+}
+
+test "an inexact rename too large to diff keeps the rename without hunks" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    const head = try makeLines(gpa, 'k', 0, 14);
+    defer gpa.free(head);
+    const tail = try makeLines(gpa, 'k', 15, 15);
+    defer gpa.free(tail);
+    const old_bytes = try std.mem.concat(gpa, u8, &.{ head, "k line 14\n", tail });
+    defer gpa.free(old_bytes);
+    const new_bytes = try std.mem.concat(gpa, u8, &.{ head, "edited line\n", tail });
+    defer gpa.free(new_bytes);
+
+    const old_blob = try odb.write(.blob, old_bytes, null);
+    const new_blob = try odb.write(.blob, new_bytes, null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{ .max_diff_memory_bytes = 1 }, null);
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), result.patches.len);
+    try testing.expectEqual(Status.renamed, result.patches[0].status);
+    try testing.expectEqual(@as(usize, 0), result.patches[0].hunks.len);
+}
+
+test "detect_renames false disables inexact detection" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    const old_bytes = try makeLines(gpa, 'k', 0, 30);
+    defer gpa.free(old_bytes);
+    const head = try makeLines(gpa, 'k', 0, 14);
+    defer gpa.free(head);
+    const tail = try makeLines(gpa, 'k', 15, 15);
+    defer gpa.free(tail);
+    const new_bytes = try std.mem.concat(gpa, u8, &.{ head, "edited line\n", tail });
+    defer gpa.free(new_bytes);
+
+    const old_blob = try odb.write(.blob, old_bytes, null);
+    const new_blob = try odb.write(.blob, new_bytes, null);
+    const old_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "old.txt", .oid = old_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "new.txt", .oid = new_blob }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{ .detect_renames = false }, null);
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), result.patches.len);
+    for (result.patches) |patch| try testing.expect(patch.status != .renamed);
+}
+
 fn writeTestTree(odb: *Odb, entries: []const Tree.Entry) !Oid {
     const tree: Tree = .{ .entries = entries };
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try tree.write(&w);
     return odb.write(.tree, w.buffered(), null);
+}
+
+test "a tied rename takes the source whose basename matches" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    const body = try makeLines(gpa, 'q', 0, 20);
+    defer gpa.free(body);
+    const blob = try odb.write(.blob, body, null);
+
+    // Two identical sources, so similarity cannot separate them. Path order
+    // alone would take `dirA/thing.txt`; git takes `dirB/other.txt`, because
+    // its basename matches the destination's.
+    const dir_a = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "thing.txt", .oid = blob }});
+    const dir_b = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "other.txt", .oid = blob }});
+    const old_tree = try writeTestTree(&odb, &.{
+        .{ .mode = .tree, .name = "dirA", .oid = dir_a },
+        .{ .mode = .tree, .name = "dirB", .oid = dir_b },
+    });
+
+    const dir_c = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "other.txt", .oid = blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .tree, .name = "dirC", .oid = dir_c }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer result.deinit(gpa);
+
+    for (result.patches) |p| {
+        if (p.status != .renamed) continue;
+        try testing.expectEqualStrings("dirB/other.txt", p.old_path);
+        try testing.expectEqualStrings("dirC/other.txt", p.new_path);
+        return;
+    }
+    return error.NoRenameFound;
+}
+
+test "a tied inexact rename takes the source whose basename matches" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var odb: Odb = undefined;
+    try initTestOdb(&tmp, &odb);
+    defer odb.deinit();
+
+    // Two sources share their content, so they score the same against the
+    // destination, and neither equals it, so the exact pass leaves both for
+    // scoring. Git pairs the destination with the matching basename at 94
+    // percent and deletes the other.
+    const head = try makeLines(gpa, 'z', 0, 9);
+    defer gpa.free(head);
+    const tail = try makeLines(gpa, 'z', 10, 19);
+    defer gpa.free(tail);
+    const source_bytes = try std.mem.concat(gpa, u8, &.{ head, "z line 9\n", tail });
+    defer gpa.free(source_bytes);
+    const dest_bytes = try std.mem.concat(gpa, u8, &.{ head, "changed line\n", tail });
+    defer gpa.free(dest_bytes);
+
+    const source_blob = try odb.write(.blob, source_bytes, null);
+    const dest_blob = try odb.write(.blob, dest_bytes, null);
+
+    const dir_a = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "thing.txt", .oid = source_blob }});
+    const dir_b = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "other.txt", .oid = source_blob }});
+    const old_tree = try writeTestTree(&odb, &.{
+        .{ .mode = .tree, .name = "dirA", .oid = dir_a },
+        .{ .mode = .tree, .name = "dirB", .oid = dir_b },
+    });
+
+    const dir_c = try writeTestTree(&odb, &.{.{ .mode = .blob, .name = "other.txt", .oid = dest_blob }});
+    const new_tree = try writeTestTree(&odb, &.{.{ .mode = .tree, .name = "dirC", .oid = dir_c }});
+
+    var result = try diffTrees(gpa, &odb, old_tree, new_tree, .{}, null);
+    defer result.deinit(gpa);
+
+    for (result.patches) |p| {
+        if (p.status != .renamed) continue;
+        try testing.expectEqualStrings("dirB/other.txt", p.old_path);
+        try testing.expectEqualStrings("dirC/other.txt", p.new_path);
+        try testing.expect(p.similarity > 50 and p.similarity < 100);
+        return;
+    }
+    return error.NoRenameFound;
 }
