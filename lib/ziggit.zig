@@ -122,6 +122,28 @@ pub const worktreeList = @import("ziggit-worktree").list;
 pub const worktreeFreeList = @import("ziggit-worktree").freeList;
 pub const WorktreeEntry = @import("ziggit-worktree").Entry;
 
+// Three-way merge. `mergeTrees` takes an object database, since a tree
+// merge needs no commit graph; `mergeCommits` takes a repository, because
+// finding the merge base does. `writeTree` turns a result into the tree
+// `git merge-tree --write-tree` prints.
+pub const mergeFile = @import("ziggit-merge").mergeFile;
+pub const mergeTrees = @import("ziggit-merge").mergeTrees;
+pub const mergeCommits = @import("ziggit-merge").mergeCommits;
+pub const writeMergeTree = @import("ziggit-merge").writeTree;
+pub const MergeInput = @import("ziggit-merge").Input;
+pub const MergeFileOptions = @import("ziggit-merge").FileOptions;
+pub const MergeFileResult = @import("ziggit-merge").FileResult;
+pub const MergeOptions = @import("ziggit-merge").Options;
+pub const MergeResult = @import("ziggit-merge").Result;
+pub const MergeConflict = @import("ziggit-merge").Conflict;
+pub const MergeConflictKind = @import("ziggit-merge").ConflictKind;
+
+// The best common ancestors of two commits. An empty slice from
+// `mergeBases` means unrelated histories, which `mergeCommits` turns into
+// `error.UnrelatedHistories`.
+pub const mergeBase = @import("ziggit-revwalk").mergeBase;
+pub const mergeBases = @import("ziggit-revwalk").mergeBases;
+
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;
 pub const updateAll = @import("ziggit-submodule").updateAll;
@@ -143,6 +165,7 @@ test {
     _ = @import("ziggit-fetch");
     _ = @import("ziggit-submodule");
     _ = @import("ziggit-diff");
+    _ = @import("ziggit-merge");
 }
 
 // A function is not a type: `discover` being exported gives a consumer no
@@ -190,6 +213,13 @@ const SurfaceCheck = struct {
     pub fn takesDiffOrigin(_: DiffOrigin) void {}
     pub fn takesDiffStatus(_: DiffStatus) void {}
     pub fn takesDiffOptions(_: DiffOptions) void {}
+    pub fn takesMergeInput(_: MergeInput) void {}
+    pub fn takesMergeFileOptions(_: MergeFileOptions) void {}
+    pub fn takesMergeFileResult(_: *MergeFileResult) void {}
+    pub fn takesMergeOptions(_: MergeOptions) void {}
+    pub fn takesMergeResult(_: *MergeResult) void {}
+    pub fn takesMergeConflict(_: MergeConflict) void {}
+    pub fn takesMergeConflictKind(_: MergeConflictKind) void {}
 };
 
 test "the front package's re-exports are usable as types in a signature" {

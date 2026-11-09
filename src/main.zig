@@ -46,14 +46,14 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
 
-    run(gpa, io, args[1..], stdout, stderr) catch {
+    run(gpa, io, args[1..], stdout, stderr) catch |err| {
         // We are already exiting non-zero. A flush failure here would
         // not change that outcome, and there is no lower path left to
         // report it on, so we drop it on purpose.
         stdout.flush() catch {};
         // Same reasoning as the flush above: nothing left to tell.
         stderr.flush() catch {};
-        std.process.exit(1);
+        std.process.exit(exitCodeFor(err));
     };
 
     try stdout.flush();
@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "checkout", "diff", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "checkout", "diff", "merge-tree", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -127,6 +127,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         try checkoutCmd(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "diff")) {
         try diffCmd(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "merge-tree")) {
+        try mergeTreeCmd(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "ls-tree")) {
         try lsTree(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "rev-parse")) {
@@ -969,4 +971,118 @@ fn checkoutCmd(
         return err;
     };
     try stdout.print("HEAD is now at {f}\n", .{target});
+}
+
+/// `ziggit merge-tree <ours> <theirs> [--merge-base <rev>]`, in git's own
+/// output shape: the tree oid on line one, then for a conflict one
+/// `mode oid stage<TAB>path` line per surviving side, a blank line, and the
+/// messages. Exit 0 clean, 1 conflict.
+fn mergeTreeCmd(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    _ = io;
+    const usage = "usage: ziggit merge-tree <ours> <theirs> [--merge-base <rev>]\n";
+    if (args.len != 2 and args.len != 4) {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    }
+    if (args.len == 4 and !std.mem.eql(u8, args[2], "--merge-base")) {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    }
+
+    var diag: ?Diagnostic = null;
+    // Resolved to the object itself, not peeled to a tree: `mergeCommits`
+    // needs the commits so it can walk for the merge base.
+    const ours = ziggit.resolve(gpa, repo, args[0], &diag) catch |err| {
+        try reportDiag(gpa, stderr, "merge-tree", err, &diag, args[0]);
+        return err;
+    };
+    const theirs = ziggit.resolve(gpa, repo, args[1], &diag) catch |err| {
+        try reportDiag(gpa, stderr, "merge-tree", err, &diag, args[1]);
+        return err;
+    };
+
+    // Git labels the conflict markers with the revs it was given, not with
+    // "ours" and "theirs", so the names reach the merge.
+    const file_options: ziggit.MergeFileOptions = .{
+        .our_label = args[0],
+        .their_label = args[1],
+    };
+
+    var result = blk: {
+        if (args.len == 4) {
+            const base_tree = resolveTreeish(gpa, repo, args[3], &diag) catch |err| {
+                try reportDiag(gpa, stderr, "merge-tree", err, &diag, args[3]);
+                return err;
+            };
+            const our_tree = try ziggit.peel(gpa, repo, ours, .tree);
+            const their_tree = try ziggit.peel(gpa, repo, theirs, .tree);
+            break :blk ziggit.mergeTrees(gpa, &repo.odb, base_tree, our_tree, their_tree, .{ .file = file_options }, &diag) catch |err| {
+                try reportDiag(gpa, stderr, "merge-tree", err, &diag, null);
+                return err;
+            };
+        }
+        break :blk ziggit.mergeCommits(gpa, repo, ours, theirs, .{ .file = file_options }, &diag) catch |err| {
+            // Git refuses unrelated histories with a fatal, which is
+            // neither of its two ordinary exits.
+            if (err == error.UnrelatedHistories) {
+                try stderr.writeAll("ziggit: refusing to merge unrelated histories\n");
+                return err;
+            }
+            try reportDiag(gpa, stderr, "merge-tree", err, &diag, null);
+            return err;
+        };
+    };
+    defer result.deinit(gpa);
+
+    const tree = ziggit.writeMergeTree(gpa, &repo.odb, result, &diag) catch |err| {
+        try reportDiag(gpa, stderr, "merge-tree", err, &diag, null);
+        return err;
+    };
+    try stdout.print("{f}\n", .{tree});
+
+    if (!result.hasConflicts()) return;
+
+    for (result.index.entries) |e| {
+        if (e.stage == .merged) continue;
+        try stdout.print("{o} {f} {d}\t{s}\n", .{
+            @backingInt(e.mode),
+            e.oid,
+            @backingInt(e.stage),
+            e.path,
+        });
+    }
+    try stdout.writeAll("\n");
+    for (result.conflicts) |c| {
+        try stdout.print("CONFLICT ({s}): {s}\n", .{ conflictLabel(c.kind), c.path });
+    }
+    return error.MergeConflict;
+}
+
+/// Git's own words for each conflict kind, as its messages spell them.
+fn conflictLabel(kind: ziggit.MergeConflictKind) []const u8 {
+    return switch (kind) {
+        .content => "content",
+        .add_add => "add/add",
+        .modify_delete => "modify/delete",
+        .delete_modify => "modify/delete",
+        .directory_file => "directory/file",
+    };
+}
+
+/// Git reserves exit 1 for "the operation ran and the answer is no", such
+/// as a merge that conflicts, and uses 128 for a refusal. A caller reading
+/// the three outcomes of `merge-tree` needs those apart: exit 1 means
+/// conflict, anything else means it did not run.
+fn exitCodeFor(err: anyerror) u8 {
+    return switch (err) {
+        error.MergeConflict => 1,
+        else => 128,
+    };
 }
