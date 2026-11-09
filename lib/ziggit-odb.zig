@@ -14,6 +14,7 @@ const alternates_mod = @import("ziggit-odb/alternates.zig");
 
 const tree_builder_mod = @import("ziggit-odb/TreeBuilder.zig");
 pub const writeTreeFromIndex = tree_builder_mod.writeTreeFromIndex;
+pub const TreeBuilderError = tree_builder_mod.Error;
 
 test {
     _ = odb_mod;
