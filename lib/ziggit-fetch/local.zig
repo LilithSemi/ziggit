@@ -102,10 +102,19 @@ pub fn fetchLocal(
         }
     }
 
+    var head_symref: ?[]const u8 = null;
+    errdefer if (head_symref) |s| gpa.free(s);
+    for (listing) |ref| {
+        if (!std.mem.eql(u8, ref.name, "HEAD")) continue;
+        if (ref.symref_target) |target| head_symref = try gpa.dupe(u8, target);
+        break;
+    }
+
     return .{
         .updated = updated,
         .objects_received = copied.objects,
         .bytes_received = copied.bytes,
+        .head_symref = head_symref,
     };
 }
 
@@ -1645,4 +1654,57 @@ test "the HEAD line a local source advertises names the branch it points at" {
     // First, the way a real upload-pack advertises it.
     try testing.expectEqualStrings("HEAD", listing[0].name);
     try testing.expectEqualStrings("refs/heads/main", listing[0].symref_target.?);
+}
+
+test "a local fetch reports which branch HEAD points at" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    _ = try buildSourceHistory(gpa, &source);
+
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    const source_path = try realPathOf(gpa, io, source_tmp.dir);
+    defer gpa.free(source_path);
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    var result = try fetchLocal(gpa, io, &dest, source_path, .{ .refspecs = &rs }, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqualStrings("refs/heads/main", result.head_symref.?);
+}
+
+test "a detached source reports no branch for HEAD" {
+    // Nothing to name, so the field stays null rather than inventing a
+    // branch from the oid.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var source_tmp = testing.tmpDir(.{ .iterate = true });
+    defer source_tmp.cleanup();
+    var source = try openTestRepo(gpa, io, source_tmp.dir);
+    defer source.deinit();
+    const history = try buildSourceHistory(gpa, &source);
+    try source.refs.setHeadDetached(history.commit_oid, null, null);
+
+    var dest_tmp = testing.tmpDir(.{ .iterate = true });
+    defer dest_tmp.cleanup();
+    var dest = try openTestRepo(gpa, io, dest_tmp.dir);
+    defer dest.deinit();
+
+    const source_path = try realPathOf(gpa, io, source_tmp.dir);
+    defer gpa.free(source_path);
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    var result = try fetchLocal(gpa, io, &dest, source_path, .{ .refspecs = &rs }, null);
+    defer result.deinit(gpa);
+
+    try testing.expect(result.head_symref == null);
 }

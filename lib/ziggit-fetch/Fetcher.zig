@@ -109,6 +109,15 @@ pub const Result = struct {
     updated: []const UpdatedRef,
     objects_received: u32,
     bytes_received: u64,
+    /// The ref the remote's HEAD points at, such as `refs/heads/main`, or
+    /// null when the remote sent no symref for it. A clone needs this to
+    /// pick a default branch; matching HEAD's oid against branch tips is
+    /// ambiguous when two branches share a tip. Owned; freed by `deinit`.
+    head_symref: ?[]const u8 = null,
+    /// The protocol version the server answered with. Always 2 today,
+    /// because `fetchRemote` refuses anything else, and reported so a
+    /// caller can say which version it got rather than guess.
+    protocol_version: u8 = 2,
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
         for (r.updated) |item| {
@@ -116,6 +125,7 @@ pub const Result = struct {
             mutable.deinit(gpa);
         }
         gpa.free(r.updated);
+        if (r.head_symref) |s| gpa.free(s);
         r.* = undefined;
     }
 
@@ -253,10 +263,19 @@ pub fn fetchRemote(
         }
     }
 
+    var head_symref: ?[]const u8 = null;
+    errdefer if (head_symref) |s| gpa.free(s);
+    for (listing) |ref| {
+        if (!std.mem.eql(u8, ref.name, "HEAD")) continue;
+        if (ref.symref_target) |target| head_symref = try gpa.dupe(u8, target);
+        break;
+    }
+
     return .{
         .updated = updated,
         .objects_received = received.objects,
         .bytes_received = received.bytes,
+        .head_symref = head_symref,
     };
 }
 
@@ -386,12 +405,17 @@ fn lsRefs(
         const prefix = if (std.mem.endsWith(u8, rs.src, "*")) rs.src[0 .. rs.src.len - 1] else rs.src;
         try prefixes.append(gpa, prefix);
     }
+    // `HEAD` is asked for separately because no refspec prefix reaches it:
+    // `refs/heads/` does not match the name `HEAD`. A clone needs the branch
+    // the remote's HEAD names, and comparing oids cannot tell which branch
+    // that is when two of them share a tip.
+    try prefixes.append(gpa, "HEAD");
 
     var body_w: std.Io.Writer.Allocating = .init(gpa);
     defer body_w.deinit();
     proto.writeLsRefs(&body_w.writer, format, .{
         .prefixes = prefixes.items,
-        .symrefs = false,
+        .symrefs = true,
         .peel = false,
     }) catch return error.ProtocolError;
 
@@ -923,6 +947,9 @@ const FakeTransport = struct {
     ls_reader: std.Io.Reader = undefined,
     fetch_reader: std.Io.Reader = undefined,
     fetch_bodies: std.ArrayList([]u8) = .empty,
+    /// The ls-refs body the last call sent, so a test can assert what was
+    /// asked for rather than only what came back.
+    ls_refs_body: ?[]u8 = null,
 
     fn transport(self: *FakeTransport) Transport {
         return .{ .ptr = self, .vtable = &vtable };
@@ -931,6 +958,7 @@ const FakeTransport = struct {
     fn deinit(self: *FakeTransport) void {
         for (self.fetch_bodies.items) |b| self.gpa.free(b);
         self.fetch_bodies.deinit(self.gpa);
+        if (self.ls_refs_body) |b| self.gpa.free(b);
     }
 
     const vtable: Transport.VTable = .{
@@ -967,6 +995,8 @@ const FakeTransport = struct {
         _ = diag;
         const self: *FakeTransport = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, cmd.name, "ls-refs")) {
+            if (self.ls_refs_body) |b| self.gpa.free(b);
+            self.ls_refs_body = gpa.dupe(u8, cmd.body) catch return error.OutOfMemory;
             self.ls_reader = .fixed(self.ls_refs_response);
             out.* = &self.ls_reader;
             return;
@@ -2480,4 +2510,66 @@ test "FETCH_HEAD lists one line per updated ref" {
     defer gpa.free(expected);
 
     try testing.expectEqualStrings(expected, fetch_head_content);
+}
+
+test "a remote fetch reports the branch the server's HEAD names" {
+    // The server line is the shape a real forge sends:
+    //   <oid> HEAD symref-target:refs/heads/master
+    // No refspec prefix reaches `HEAD`, so `lsRefs` asks for it by name.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir, test_committer);
+    defer repo.deinit();
+
+    const payload = try buildCommitPayload(gpa, null, "one");
+    defer gpa.free(payload);
+    const oid = commitOid(payload);
+
+    var hex_buf: [Oid.max_formatted_length]u8 = undefined;
+    const hex = oid.toHex(&hex_buf);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const branch_line = try std.fmt.allocPrint(gpa, "{s} refs/heads/master", .{hex});
+    defer gpa.free(branch_line);
+    const head_line = try std.fmt.allocPrint(gpa, "{s} HEAD symref-target:refs/heads/master", .{hex});
+    defer gpa.free(head_line);
+    try pktline_mod.writeLine(&aw.writer, branch_line);
+    try pktline_mod.writeLine(&aw.writer, head_line);
+    try pktline_mod.write(&aw.writer, .flush);
+
+    var built = try pack_mod.testing.buildTestPack(gpa, .sha1, &.{.{ .object = .{ .kind = .commit, .payload = payload } }});
+    defer built.deinit(gpa);
+    const fetch_bytes = try buildReadyPackResponse(gpa, oid, built.bytes);
+    defer gpa.free(fetch_bytes);
+
+    var fake: FakeTransport = .{ .gpa = gpa, .ls_refs_response = aw.written(), .fetch_responses = &.{fetch_bytes} };
+    defer fake.deinit();
+
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+    var result = try fetchRemote(gpa, io, &repo, fake.transport(), .{ .refspecs = &rs }, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqualStrings("refs/heads/master", result.head_symref.?);
+    try testing.expectEqual(@as(u8, 2), result.protocol_version);
+}
+
+test "lsRefs asks the server for HEAD and for symrefs" {
+    // Without both, the HEAD line never arrives: `refs/heads/` does not
+    // match the name `HEAD`, and the target is only sent when asked.
+    const gpa = testing.allocator;
+    var rs = [_]Refspec{try Refspec.parse(gpa, "+refs/heads/*:refs/remotes/origin/*")};
+    defer for (&rs) |*r| r.deinit(gpa);
+
+    var fake: FakeTransport = .{ .gpa = gpa, .ls_refs_response = &.{}, .fetch_responses = &.{} };
+    defer fake.deinit();
+
+    const listing = lsRefs(gpa, .sha1, fake.transport(), &rs, null) catch &.{};
+    defer gpa.free(listing);
+
+    const sent = fake.ls_refs_body orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, sent, "symrefs") != null);
+    try testing.expect(std.mem.indexOf(u8, sent, "ref-prefix HEAD") != null);
 }
