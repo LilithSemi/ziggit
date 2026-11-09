@@ -16,6 +16,8 @@ pub const countReachable = walk_mod.countReachable;
 /// graph-walking surface; exported here purely so `ziggit-fetch` has one
 /// shared implementation to call instead of keeping its own copy.
 pub const isAncestor = walk_mod.isAncestor;
+pub const mergeBase = walk_mod.mergeBase;
+pub const mergeBases = walk_mod.mergeBases;
 
 test {
     _ = revparse_mod;

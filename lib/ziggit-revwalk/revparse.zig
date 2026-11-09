@@ -28,7 +28,7 @@ const Store = refs_mod.Store;
 const repo_mod = @import("ziggit-repo");
 const Repository = repo_mod.Repository;
 
-pub const Error = error{ UnknownRevision, AmbiguousPrefix, NotThatKind } || Odb.Error || Store.Error;
+pub const Error = error{ UnknownRevision, AmbiguousPrefix, NotThatKind, HistoryTooDeep } || Odb.Error || Store.Error;
 
 /// Allocation budget for reading one tag or commit object whole, while
 /// peeling. Both comfortably fit; this is a policy ceiling against a

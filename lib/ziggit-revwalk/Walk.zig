@@ -48,18 +48,24 @@ const max_commit_object_len: usize = 1 << 20;
 /// would make them wrong, not merely slow.
 const max_ancestry_walk: usize = 100_000;
 
+/// Visit budget for walks that must cover the whole graph they are given.
+const unbounded_walk: usize = std.math.maxInt(usize);
+
 /// Reads every commit reachable from `roots` into `times` (oid -> commit
 /// time), each recorded once no matter how many paths reach it or whether
 /// the graph loops. A commit named in `shallow` is an expected dead end and
 /// does not error when unreadable. A missing or corrupt commit anywhere
 /// else is a fatal error: returns `error.CorruptObject`. Only
-/// `error.OutOfMemory` escapes from allocator failures.
+/// `error.OutOfMemory` escapes from allocator failures. Recording more than
+/// `max_visits` commits returns `error.HistoryTooDeep`, which says the walk
+/// ran out of budget rather than blaming the objects.
 fn collectReachable(
     gpa: Allocator,
     repo: *Repository,
     roots: []const Oid,
     times: *std.AutoHashMapUnmanaged(Oid, i64),
     shallow: std.AutoHashMapUnmanaged(Oid, void),
+    max_visits: usize,
     diag: ?*?Diagnostic,
 ) Error!void {
     var seen: std.AutoHashMapUnmanaged(Oid, void) = .empty;
@@ -93,6 +99,7 @@ fn collectReachable(
         defer commit.deinit(gpa);
 
         try times.put(gpa, current, commit.committer.when);
+        if (times.count() > max_visits) return error.HistoryTooDeep;
         for (commit.parents) |p| {
             if (seen.contains(p)) continue;
             try seen.put(gpa, p, {});
@@ -149,12 +156,12 @@ pub const Walk = struct {
 
         var visible: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
         defer visible.deinit(w.gpa);
-        try collectReachable(w.gpa, w.repo, w.pushed.items, &visible, shallow, null);
+        try collectReachable(w.gpa, w.repo, w.pushed.items, &visible, shallow, unbounded_walk, null);
 
         if (w.hidden.items.len > 0) {
             var excluded: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
             defer excluded.deinit(w.gpa);
-            try collectReachable(w.gpa, w.repo, w.hidden.items, &excluded, shallow, null);
+            try collectReachable(w.gpa, w.repo, w.hidden.items, &excluded, shallow, unbounded_walk, null);
             var it = excluded.keyIterator();
             while (it.next()) |k| _ = visible.remove(k.*);
         }
@@ -195,7 +202,7 @@ pub fn countReachable(gpa: Allocator, repo: *Repository, oid: Oid) Error!u32 {
 
     var times: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
     defer times.deinit(gpa);
-    try collectReachable(gpa, repo, &.{oid}, &times, shallow, null);
+    try collectReachable(gpa, repo, &.{oid}, &times, shallow, unbounded_walk, null);
     return @intCast(times.count());
 }
 
@@ -209,6 +216,14 @@ pub fn countReachable(gpa: Allocator, repo: *Repository, oid: Oid) Error!u32 {
 /// search rather than failing the whole check: it is evidence against a
 /// fast forward, not a fault in this walk. `diag`, when given, carries
 /// detail for whichever one of those reads or parses last failed.
+///
+/// Reaching the bound returns `false`, which is fail closed rather than a
+/// claim about the graph: the caller then refuses to move a ref it could
+/// not prove is a fast forward. `mergeBases` errors in the same situation
+/// because a partial answer there is a wrong answer, while here the
+/// conservative action and the unproven one agree. Exhausting the budget
+/// also usually does mean `old` is unreachable, since a real fast forward
+/// finds its target within a few commits.
 ///
 /// Shared by `Fetcher.applyRefUpdates`'s fast-forward check, so this and
 /// only this is what decides that question; it used to be a private copy
@@ -249,6 +264,172 @@ pub fn isAncestor(gpa: Allocator, repo: *Repository, old: Oid, new: Oid, diag: ?
         }
     }
     return false;
+}
+
+/// The best common ancestors of `a` and `b`, newest first. Two or more
+/// results mean a criss-cross history. An empty slice means unrelated
+/// histories. The caller frees the slice with `gpa`. A walk that exceeds
+/// `max_ancestry_walk` commits fails with `error.HistoryTooDeep` rather
+/// than return a base that might be wrong.
+pub fn mergeBases(gpa: Allocator, repo: *Repository, a: Oid, b: Oid, diag: ?*?Diagnostic) Error![]Oid {
+    return mergeBasesBounded(gpa, repo, a, b, max_ancestry_walk, diag);
+}
+
+/// The first of `mergeBases`, or null for unrelated histories.
+pub fn mergeBase(gpa: Allocator, repo: *Repository, a: Oid, b: Oid, diag: ?*?Diagnostic) Error!?Oid {
+    const bases = try mergeBases(gpa, repo, a, b, diag);
+    defer gpa.free(bases);
+    return if (bases.len == 0) null else bases[0];
+}
+
+/// `mergeBases` with an explicit visit budget for each of its walks.
+fn mergeBasesBounded(gpa: Allocator, repo: *Repository, a: Oid, b: Oid, max_visits: usize, diag: ?*?Diagnostic) Error![]Oid {
+    var shallow = try readShallowBoundary(gpa, repo.io, repo.layout.common_dir, repo.format, null);
+    defer shallow.deinit(gpa);
+
+    var from_a: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
+    defer from_a.deinit(gpa);
+    try collectReachable(gpa, repo, &.{a}, &from_a, shallow, max_visits, diag);
+
+    var from_b: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
+    defer from_b.deinit(gpa);
+    try collectReachable(gpa, repo, &.{b}, &from_b, shallow, max_visits, diag);
+
+    var common: std.ArrayList(Oid) = .empty;
+    defer common.deinit(gpa);
+    var it = from_a.iterator();
+    while (it.next()) |e| {
+        if (!from_b.contains(e.key_ptr.*)) continue;
+        try common.append(gpa, e.key_ptr.*);
+    }
+
+    // A common commit is redundant when another common commit reaches it.
+    // Every such commit is an ancestor of some parent of a common commit.
+    var parents: std.ArrayList(Oid) = .empty;
+    defer parents.deinit(gpa);
+    for (common.items) |c| {
+        const ps = try parentsOf(gpa, repo, c, diag);
+        defer gpa.free(ps);
+        try parents.appendSlice(gpa, ps);
+    }
+    var redundant: std.AutoHashMapUnmanaged(Oid, i64) = .empty;
+    defer redundant.deinit(gpa);
+    try collectReachable(gpa, repo, parents.items, &redundant, shallow, max_visits, diag);
+
+    var bases: std.ArrayList(Oid) = .empty;
+    defer bases.deinit(gpa);
+    for (common.items) |c| {
+        if (redundant.contains(c)) continue;
+        try bases.append(gpa, c);
+    }
+    try rankBases(gpa, repo, a, b, &from_a, &from_b, bases.items, diag);
+
+    return gpa.dupe(Oid, bases.items);
+}
+
+/// The parent ids of one commit. The caller frees the slice with `gpa`.
+fn parentsOf(gpa: Allocator, repo: *Repository, oid: Oid, diag: ?*?Diagnostic) Error![]Oid {
+    const bytes = try repo.odb.readAlloc(gpa, oid, max_commit_object_len, diag);
+    defer gpa.free(bytes);
+
+    var commit = Commit.parse(gpa, repo.format, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CorruptCommit => return error.CorruptObject,
+    };
+    defer commit.deinit(gpa);
+    return gpa.dupe(Oid, commit.parents);
+}
+
+const paint_first: u8 = 1 << 0;
+const paint_second: u8 = 1 << 1;
+const paint_stale: u8 = 1 << 2;
+const paint_result: u8 = 1 << 3;
+
+const Pending = struct { oid: Oid, when: i64, seq: usize };
+
+/// Newest first. On equal times, the entry pushed first comes first.
+fn pendingFirst(_: void, x: Pending, y: Pending) std.math.Order {
+    if (x.when != y.when) return std.math.order(y.when, x.when);
+    return std.math.order(x.seq, y.seq);
+}
+
+fn committedAt(from_a: *const std.AutoHashMapUnmanaged(Oid, i64), from_b: *const std.AutoHashMapUnmanaged(Oid, i64), oid: Oid) ?i64 {
+    return from_a.get(oid) orelse from_b.get(oid);
+}
+
+fn paintPush(
+    gpa: Allocator,
+    flags: *std.AutoHashMapUnmanaged(Oid, u8),
+    queue: *std.PriorityQueue(Pending, void, pendingFirst),
+    oid: Oid,
+    bits: u8,
+    when: i64,
+    seq: *usize,
+) Allocator.Error!void {
+    try flags.put(gpa, oid, (flags.get(oid) orelse 0) | bits);
+    try queue.push(gpa, .{ .oid = oid, .when = when, .seq = seq.* });
+    seq.* += 1;
+}
+
+/// Sorts `bases` the way git's `merge-base` lists them: newest first, with
+/// the order the paint reaches each base breaking ties. The paint pops the
+/// newest commit first, starting from `a` and `b`. The sort is in place.
+/// Every base must be one of the common commits `a` and `b` reach.
+fn rankBases(
+    gpa: Allocator,
+    repo: *Repository,
+    a: Oid,
+    b: Oid,
+    from_a: *const std.AutoHashMapUnmanaged(Oid, i64),
+    from_b: *const std.AutoHashMapUnmanaged(Oid, i64),
+    bases: []Oid,
+    diag: ?*?Diagnostic,
+) Error!void {
+    if (bases.len < 2) return;
+
+    var flags: std.AutoHashMapUnmanaged(Oid, u8) = .empty;
+    defer flags.deinit(gpa);
+    var rank: std.AutoHashMapUnmanaged(Oid, Ranked) = .empty;
+    defer rank.deinit(gpa);
+    var queue: std.PriorityQueue(Pending, void, pendingFirst) = .empty;
+    defer queue.deinit(gpa);
+
+    var seq: usize = 0;
+    if (committedAt(from_a, from_b, a)) |when| try paintPush(gpa, &flags, &queue, a, paint_first, when, &seq);
+    if (committedAt(from_a, from_b, b)) |when| try paintPush(gpa, &flags, &queue, b, paint_second, when, &seq);
+
+    while (queue.pop()) |cur| {
+        const have = flags.get(cur.oid).?;
+        var bits = have & (paint_first | paint_second | paint_stale);
+        if (bits == (paint_first | paint_second)) {
+            if (have & paint_result == 0) {
+                try flags.put(gpa, cur.oid, have | paint_result);
+                try rank.put(gpa, cur.oid, .{ .when = cur.when, .seq = rank.count() });
+            }
+            bits |= paint_stale;
+        }
+
+        const ps = try parentsOf(gpa, repo, cur.oid, diag);
+        defer gpa.free(ps);
+        for (ps) |p| {
+            const when = committedAt(from_a, from_b, p) orelse continue;
+            if ((flags.get(p) orelse 0) & bits == bits) continue;
+            try paintPush(gpa, &flags, &queue, p, bits, when, &seq);
+        }
+    }
+
+    std.mem.sort(Oid, bases, &rank, rankedBefore);
+}
+
+/// A base's committer time, and how many bases the paint found before it.
+const Ranked = struct { when: i64, seq: usize };
+
+/// Newest first. On equal times, the base the paint found first comes first.
+fn rankedBefore(rank: *std.AutoHashMapUnmanaged(Oid, Ranked), x: Oid, y: Oid) bool {
+    const rx = rank.get(x).?;
+    const ry = rank.get(y).?;
+    if (rx.when != ry.when) return rx.when > ry.when;
+    return rx.seq < ry.seq;
 }
 
 // Test helpers shared by every test below.
@@ -804,4 +985,156 @@ test "countReachable counts a commit reachable two ways once" {
     const merge = try repo.odb.write(.commit, merge_payload, null);
 
     try testing.expectEqual(@as(u32, 4), try countReachable(gpa, &repo, merge));
+}
+
+// merge bases
+
+/// Writes a commit with the given parents and committer time, and returns
+/// its id. Each caller passes a distinct `when`, so no two commits collide.
+fn commitWithParents(gpa: Allocator, repo: *Repository, parents: []const Oid, when: i64) !Oid {
+    const hex_bufs = try gpa.alloc([Oid.max_formatted_length]u8, parents.len);
+    defer gpa.free(hex_bufs);
+    const hexes = try gpa.alloc([]const u8, parents.len);
+    defer gpa.free(hexes);
+    for (parents, hex_bufs, hexes) |p, *buf, *h| h.* = hexOf(p, buf);
+
+    const payload = try buildCommitPayload(gpa, hexes, when, "merge base fixture");
+    defer gpa.free(payload);
+    return repo.odb.write(.commit, payload, null);
+}
+
+fn containsOid(oids: []const Oid, want: Oid) bool {
+    for (oids) |o| if (o.eql(want)) return true;
+    return false;
+}
+
+test "mergeBases returns the older side when it is the base of the other" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const c1 = try commitWithParents(gpa, &repo, &.{}, 1000);
+    const c2 = try commitWithParents(gpa, &repo, &.{c1}, 2000);
+    const c3 = try commitWithParents(gpa, &repo, &.{c2}, 3000);
+
+    const bases = try mergeBases(gpa, &repo, c1, c3, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 1), bases.len);
+    try testing.expect(bases[0].eql(c1));
+
+    const flipped = try mergeBases(gpa, &repo, c3, c1, null);
+    defer gpa.free(flipped);
+    try testing.expectEqual(@as(usize, 1), flipped.len);
+    try testing.expect(flipped[0].eql(c1));
+}
+
+test "mergeBases finds the fork point of two branches off one root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const root = try commitWithParents(gpa, &repo, &.{}, 1000);
+    const x1 = try commitWithParents(gpa, &repo, &.{root}, 2000);
+    const x2 = try commitWithParents(gpa, &repo, &.{x1}, 3000);
+    const y1 = try commitWithParents(gpa, &repo, &.{root}, 2500);
+
+    const bases = try mergeBases(gpa, &repo, x2, y1, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 1), bases.len);
+    try testing.expect(bases[0].eql(root));
+
+    const base = (try mergeBase(gpa, &repo, x2, y1, null)).?;
+    try testing.expect(base.eql(root));
+}
+
+test "mergeBases is empty and mergeBase is null for unrelated histories" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const r1 = try commitWithParents(gpa, &repo, &.{}, 1000);
+    const r2 = try commitWithParents(gpa, &repo, &.{}, 2000);
+
+    const bases = try mergeBases(gpa, &repo, r1, r2, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 0), bases.len);
+    try testing.expectEqual(@as(?Oid, null), try mergeBase(gpa, &repo, r1, r2, null));
+}
+
+test "mergeBases returns both bases of a criss-cross history" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const root = try commitWithParents(gpa, &repo, &.{}, 1000);
+    const a = try commitWithParents(gpa, &repo, &.{root}, 2000);
+    const b = try commitWithParents(gpa, &repo, &.{root}, 2100);
+    const a2 = try commitWithParents(gpa, &repo, &.{ a, b }, 3000);
+    const b2 = try commitWithParents(gpa, &repo, &.{ b, a }, 3100);
+
+    const bases = try mergeBases(gpa, &repo, a2, b2, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 2), bases.len);
+    try testing.expect(containsOid(bases, a));
+    try testing.expect(containsOid(bases, b));
+    try testing.expect(!containsOid(bases, root));
+    try testing.expect(bases[0].eql(b));
+}
+
+test "mergeBases reports the bound instead of a partial answer" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const c1 = try commitWithParents(gpa, &repo, &.{}, 1000);
+    const c2 = try commitWithParents(gpa, &repo, &.{c1}, 2000);
+    const c3 = try commitWithParents(gpa, &repo, &.{c2}, 3000);
+    const c4 = try commitWithParents(gpa, &repo, &.{c3}, 4000);
+    const c5 = try commitWithParents(gpa, &repo, &.{c4}, 5000);
+
+    try testing.expectError(error.HistoryTooDeep, mergeBasesBounded(gpa, &repo, c1, c5, 3, null));
+
+    const bases = try mergeBasesBounded(gpa, &repo, c1, c5, 100, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 1), bases.len);
+    try testing.expect(bases[0].eql(c1));
+}
+
+test "mergeBases lists the newest base first" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try openTestRepo(gpa, io, tmp.dir);
+    defer repo.deinit();
+
+    const root = try commitWithParents(gpa, &repo, &.{}, 1000);
+    var side: [5]Oid = undefined;
+    for (&side, 0..) |*s, i| {
+        s.* = try commitWithParents(gpa, &repo, &.{root}, 2000 + @as(i64, @intCast(i)) * 100);
+    }
+    const x1 = try commitWithParents(gpa, &repo, &.{ side[0], side[1], side[2], side[3], side[4] }, 3000);
+    const x2 = try commitWithParents(gpa, &repo, &.{ side[2], side[4], side[0], side[3], side[1] }, 3100);
+
+    const bases = try mergeBases(gpa, &repo, x1, x2, null);
+    defer gpa.free(bases);
+    try testing.expectEqual(@as(usize, 5), bases.len);
+    for (bases, 0..) |got, i| {
+        try testing.expect(got.eql(side[4 - i]));
+    }
 }
