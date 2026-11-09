@@ -164,8 +164,12 @@ pub fn remove(
     admin_open = false;
     repo.layout.common_dir.deleteTree(io, admin_rel) catch return error.IoFailed;
 
-    // Git drops `worktrees/` once the last one goes.
-    repo.layout.common_dir.deleteDir(io, "worktrees") catch {};
+    // Git drops `worktrees/` once the last one goes. `DirNotEmpty` means
+    // another linked worktree is still registered, which is the usual case.
+    repo.layout.common_dir.deleteDir(io, "worktrees") catch |err| switch (err) {
+        error.DirNotEmpty, error.FileNotFound => {},
+        else => return error.IoFailed,
+    };
 }
 
 /// Deletes the administrative directory of every linked worktree whose `.git`
@@ -201,7 +205,12 @@ pub fn prune(gpa: Allocator, io: std.Io, repo: *Repository) Error!u32 {
         }
     }
 
-    repo.layout.common_dir.deleteDir(io, "worktrees") catch {};
+    // `DirNotEmpty` means a live worktree is still registered, which is the
+    // usual case and not a fault.
+    repo.layout.common_dir.deleteDir(io, "worktrees") catch |err| switch (err) {
+        error.DirNotEmpty, error.FileNotFound => {},
+        else => return error.IoFailed,
+    };
     return pruned;
 }
 
@@ -801,4 +810,30 @@ test "list skips an admin directory whose files cannot be read" {
 
     try testing.expectEqual(@as(usize, 1), listed.len);
     try testing.expectEqualStrings("w", listed[0].name);
+}
+
+test "remove drops worktrees/ with the last worktree and keeps it while one lives" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    for ([_][]const u8{ "one", "two" }) |name| {
+        try fx.tmp.dir.createDirPath(io, name);
+        const dir = try fx.tmp.dir.openDir(io, name, .{ .iterate = true });
+        defer dir.close(io);
+        try add(gpa, io, &fx.repo, name, dir, commit_oid, .{}, null);
+    }
+
+    try remove(gpa, io, &fx.repo, "one", .{}, null);
+    var still_there = try fx.repo.layout.common_dir.openDir(io, "worktrees", .{});
+    still_there.close(io);
+
+    try remove(gpa, io, &fx.repo, "two", .{}, null);
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees", .{}));
 }
