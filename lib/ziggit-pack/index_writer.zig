@@ -77,9 +77,7 @@ pub fn writeIndex(
     for (big_offsets.items) |off| w.writeInt(u64, off, .big) catch return error.IoFailed;
 
     // The pack checksum embedded in the index is the pack's own trailer,
-    // not a value re-derived here: `computeOidOffsets` leaves `pack`
-    // positioned right after the last object's compressed bytes, exactly
-    // where that trailer starts.
+    // not a value re-derived here.
     const pack_checksum = try readPackTrailer(f, pack);
     w.writeAll(pack_checksum.slice()) catch return error.IoFailed;
 
@@ -108,8 +106,20 @@ fn buildFanout(fanout: *[256]u32, sorted_oids: []const Oid) void {
     while (bucket <= 255) : (bucket += 1) fanout[bucket] = count;
 }
 
+/// The pack's trailing checksum, which is its last `f.byteLength()` bytes.
+///
+/// Seeks there rather than reading from wherever the reader was left. An
+/// earlier version took the bytes at the current position, which was the
+/// trailer only for a pack with no deltas; resolving a delta moves the
+/// reader, so a delta-bearing pack got 20 bytes from the middle of itself.
+/// The index stayed self-consistent and readable by ziggit, while real git
+/// reported "packfile does not match index".
 fn readPackTrailer(f: Format, pack: *std.Io.File.Reader) Pack.Error!Oid {
     const len = f.byteLength();
+    const size = pack.getSize() catch return error.CorruptPack;
+    if (size < len) return error.CorruptPack;
+    pack.seekTo(size - len) catch return error.CorruptPack;
+
     var buf: [Oid.max_byte_length]u8 = undefined;
     const bytes = pack.interface.take(len) catch return error.CorruptPack;
     @memcpy(buf[0..len], bytes);
@@ -274,3 +284,46 @@ test "writeIndex reports a write failure on out as IoFailed, not CorruptPack" {
 
 const f_sha1: Format = .sha1;
 const buildTestPack = pack_mod.buildTestPack;
+
+test "the index records the pack's own trailing checksum, with deltas present" {
+    // Reading the trailer from the reader's current position gave the right
+    // answer only for a pack with no deltas. Resolving a delta moves the
+    // reader, so this came out as 20 bytes from the middle of the pack. The
+    // index was still self-consistent, so ziggit read it back happily while
+    // real git reported "packfile does not match index". Only a pack with a
+    // delta in it shows the difference.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_payload = "hello world";
+    const base_id = object_mod.loose.hash(f_sha1, .blob, base_payload);
+    const patch = [_]u8{ 11, 5, 0x91, 0, 5 };
+
+    var built = try buildTestPack(gpa, f_sha1, &.{
+        .{ .object = .{ .kind = .blob, .payload = base_payload } },
+        .{ .ref_delta = .{ .base_id = base_id, .patch = &patch } },
+    });
+    defer built.deinit(gpa);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "p.pack", .data = built.bytes });
+    var pack_file = try tmp.dir.openFile(io, "p.pack", .{});
+    defer pack_file.close(io);
+    var pack_buf: [4096]u8 = undefined;
+    var pack_reader = pack_file.reader(io, &pack_buf);
+
+    var out_file = try tmp.dir.createFile(io, "p.idx", .{});
+    defer out_file.close(io);
+    var out_buf: [4096]u8 = undefined;
+    var out = out_file.writer(io, &out_buf);
+    try writeIndex(gpa, f_sha1, &pack_reader, &out, null);
+
+    const idx_bytes = try tmp.dir.readFileAlloc(io, "p.idx", gpa, .limited(1 << 20));
+    defer gpa.free(idx_bytes);
+
+    const hash_len = f_sha1.byteLength();
+    const recorded = idx_bytes[idx_bytes.len - 2 * hash_len .. idx_bytes.len - hash_len];
+    const expected = built.bytes[built.bytes.len - hash_len ..];
+    try std.testing.expectEqualSlices(u8, expected, recorded);
+}
