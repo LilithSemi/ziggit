@@ -40,11 +40,17 @@ pub fn validateMessage(message: []const u8) error{InvalidReflogMessage}!void {
 
 /// Appends one reflog line for `name`:
 /// "<old-hex> <new-hex> <identity> <unix-seconds> <tz>\t<message>\n", the
-/// identity, seconds and tz written by `Identity.write`. Creates
-/// `logs/<name>` and its parent directories on the ref's first reflog
-/// entry. Returns the length `logs/<name>` had before this call, so a
-/// caller that must undo this specific append after a later step fails can
-/// pass that length to `revert`.
+/// identity, seconds and tz written by `Identity.write`.
+///
+/// A null `message` writes the line with no tab and no message at all,
+/// which is what git writes for a worktree it has just created. Every other
+/// entry git writes carries a message, so null is the exception rather than
+/// a convenience.
+///
+/// Creates `logs/<name>` and its parent directories on the ref's first
+/// reflog entry. Returns the length `logs/<name>` had before this call, so
+/// a caller that must undo this specific append after a later step fails
+/// can pass that length to `revert`.
 pub fn append(
     gpa: Allocator,
     dir: std.Io.Dir,
@@ -53,9 +59,9 @@ pub fn append(
     old: Oid,
     new: Oid,
     identity: Identity,
-    message: []const u8,
+    message: ?[]const u8,
 ) Error!u64 {
-    try validateMessage(message);
+    if (message) |m| try validateMessage(m);
 
     const log_path = try std.fmt.allocPrint(gpa, "logs/{s}", .{name});
     defer gpa.free(log_path);
@@ -71,7 +77,11 @@ pub fn append(
     defer line_buf.deinit();
     line_buf.writer.print("{s} {s} ", .{ old.toHex(&old_buf), new.toHex(&new_buf) }) catch return error.IoFailed;
     identity.write(&line_buf.writer) catch return error.IoFailed;
-    line_buf.writer.print("\t{s}\n", .{message}) catch return error.IoFailed;
+    if (message) |m| {
+        line_buf.writer.print("\t{s}\n", .{m}) catch return error.IoFailed;
+    } else {
+        line_buf.writer.writeByte('\n') catch return error.IoFailed;
+    }
     const line = line_buf.written();
 
     var file = dir.createFile(io, log_path, .{ .truncate = false }) catch return error.IoFailed;

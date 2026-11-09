@@ -16,6 +16,10 @@ pub const Reference = store_mod.Reference;
 const packed_mod = @import("ziggit-refs/packed.zig");
 const loose_mod = @import("ziggit-refs/loose.zig");
 const reflog_mod = @import("ziggit-refs/reflog.zig");
+/// Appends one reflog line. Exposed because `ziggit-worktree` writes a
+/// new worktree's first `logs/HEAD` entry, which git writes as it creates
+/// the worktree rather than on the first ref update.
+pub const reflogAppend = reflog_mod.append;
 
 test {
     _ = store_mod;

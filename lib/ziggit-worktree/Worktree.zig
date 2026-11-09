@@ -41,6 +41,7 @@ const status_mod = @import("ziggit-status");
 const index_mod = @import("ziggit-index");
 const ignore_mod = @import("ziggit-ignore");
 const revwalk_mod = @import("ziggit-revwalk");
+const refs_mod = @import("ziggit-refs");
 
 pub const Error = error{
     WorktreeExists,
@@ -116,6 +117,22 @@ pub fn add(
     const dotgit_text = try std.fmt.allocPrint(gpa, "gitdir: {s}\n", .{admin_path});
     defer gpa.free(dotgit_text);
     try writeFile(io, worktree_dir, ".git", dotgit_text);
+
+    // Git writes this reflog as it creates the worktree, not lazily on the
+    // first HEAD update. Its line carries no message, unlike every other
+    // entry git writes, so `message` is null here.
+    if (repo.refs.committer) |identity| {
+        _ = refs_mod.reflogAppend(
+            gpa,
+            admin,
+            io,
+            "HEAD",
+            Oid.zero(repo.format),
+            commit,
+            identity.at(nowSeconds(io)),
+            null,
+        ) catch return error.IoFailed;
+    }
 
     const tree = try revwalk_mod.peel(gpa, repo, commit, .tree);
     try checkout_mod.checkoutTree(gpa, io, &repo.odb, worktree_dir, tree, .{
@@ -836,4 +853,57 @@ test "remove drops worktrees/ with the last worktree and keeps it while one live
 
     try remove(gpa, io, &fx.repo, "two", .{}, null);
     try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees", .{}));
+}
+
+fn nowSeconds(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
+/// Like `Fixture.init`, with an identity so reflog writing is reachable.
+/// `Repository.open` takes its committer from `user.name` and `user.email`,
+/// which a bare `Repository.init` does not set.
+fn fixtureWithIdentity(gpa: Allocator, io: std.Io) !Fixture {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    errdefer tmp.cleanup();
+    try Repository.init(gpa, io, tmp.dir, .{});
+    var layout = try repo_mod.discover(gpa, io, tmp.dir, .{}, null);
+    errdefer layout.deinit(io);
+    const r = try Repository.open(gpa, io, layout, .{
+        .committer = .{ .name = "A B", .email = "a@b.c" },
+    }, null);
+    try tmp.dir.createDirPath(io, "worktrees");
+    return .{ .tmp = tmp, .repo = r };
+}
+
+test "add writes the worktree's first HEAD reflog entry, with no message" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try fixtureWithIdentity(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const log = try fx.repo.layout.common_dir.readFileAlloc(io, "worktrees/w/logs/HEAD", gpa, .limited(4096));
+    defer gpa.free(log);
+
+    // Git's line is "<zero> <head> <identity>\n" with no tab and no
+    // message, unlike every other reflog entry it writes.
+    try testing.expect(std.mem.indexOfScalar(u8, log, '\t') == null);
+    try testing.expect(std.mem.endsWith(u8, log, "\n"));
+    var zero_buf: [Oid.max_formatted_length]u8 = undefined;
+    var head_buf: [Oid.max_formatted_length]u8 = undefined;
+    const prefix = try std.fmt.allocPrint(gpa, "{s} {s} A B <a@b.c> ", .{
+        Oid.zero(fx.repo.format).toHex(&zero_buf),
+        commit_oid.toHex(&head_buf),
+    });
+    defer gpa.free(prefix);
+    try testing.expect(std.mem.startsWith(u8, log, prefix));
 }
