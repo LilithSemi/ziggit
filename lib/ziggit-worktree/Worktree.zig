@@ -168,20 +168,154 @@ pub fn remove(
     repo.layout.common_dir.deleteDir(io, "worktrees") catch {};
 }
 
+/// Deletes the administrative directory of every linked worktree whose `.git`
+/// file is gone, and `worktrees/` once it is empty. Worktree directories are
+/// left alone. Returns how many administrative directories were deleted.
+pub fn prune(gpa: Allocator, io: std.Io, repo: *Repository) Error!u32 {
+    var root = repo.layout.common_dir.openDir(io, "worktrees", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return error.IoFailed,
+    };
+    defer root.close(io);
+
+    // Names are collected first so that no directory is deleted mid-iteration.
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| gpa.free(name);
+        names.deinit(gpa);
+    }
+
+    var it = root.iterate();
+    while (it.next(io) catch return error.IoFailed) |entry| {
+        if (entry.kind != .directory) continue;
+        const name = try gpa.dupe(u8, entry.name);
+        errdefer gpa.free(name);
+        try names.append(gpa, name);
+    }
+
+    var pruned: u32 = 0;
+    for (names.items) |name| {
+        if (try isPrunable(gpa, io, root, name)) {
+            root.deleteTree(io, name) catch return error.IoFailed;
+            pruned += 1;
+        }
+    }
+
+    repo.layout.common_dir.deleteDir(io, "worktrees") catch {};
+    return pruned;
+}
+
+pub const Entry = struct {
+    name: []const u8,
+    /// The worktree directory, not the `.git` file inside it.
+    path: []const u8,
+    head: Oid,
+};
+
+/// Lists the linked worktrees under `worktrees/`. An administrative directory
+/// whose `gitdir` or `HEAD` cannot be read is skipped. The strings in each
+/// entry are owned by the caller, so release the result with `freeList`.
+pub fn list(gpa: Allocator, io: std.Io, repo: *Repository) Error![]Entry {
+    var root = repo.layout.common_dir.openDir(io, "worktrees", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return error.IoFailed,
+    };
+    defer root.close(io);
+
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (entries.items) |entry| freeEntry(gpa, entry);
+        entries.deinit(gpa);
+    }
+
+    var it = root.iterate();
+    while (it.next(io) catch return error.IoFailed) |dir_entry| {
+        if (dir_entry.kind != .directory) continue;
+        const entry = (try readEntry(gpa, io, root, dir_entry.name, repo.format)) orelse continue;
+        errdefer freeEntry(gpa, entry);
+        try entries.append(gpa, entry);
+    }
+
+    return entries.toOwnedSlice(gpa);
+}
+
+/// Releases a slice returned by `list`.
+pub fn freeList(gpa: Allocator, entries: []Entry) void {
+    for (entries) |entry| freeEntry(gpa, entry);
+    gpa.free(entries);
+}
+
+fn freeEntry(gpa: Allocator, entry: Entry) void {
+    gpa.free(entry.name);
+    gpa.free(entry.path);
+}
+
+/// An administrative directory is stale when its `gitdir` file cannot be read,
+/// or names a `.git` file that no longer exists.
+fn isPrunable(gpa: Allocator, io: std.Io, root: std.Io.Dir, name: []const u8) Error!bool {
+    var admin = root.openDir(io, name, .{}) catch return true;
+    defer admin.close(io);
+
+    const dotgit = try readGitdirFile(gpa, io, admin) orelse return true;
+    defer gpa.free(dotgit);
+
+    _ = std.Io.Dir.cwd().statFile(io, dotgit, .{}) catch return true;
+    return false;
+}
+
+/// Returns null when the administrative directory has an unreadable file.
+fn readEntry(
+    gpa: Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    name: []const u8,
+    format: oid_mod.Format,
+) Error!?Entry {
+    var admin = root.openDir(io, name, .{}) catch return null;
+    defer admin.close(io);
+
+    const dotgit = try readGitdirFile(gpa, io, admin) orelse return null;
+    defer gpa.free(dotgit);
+
+    const head_text = try tryReadFile(gpa, io, admin, "HEAD", 256) orelse return null;
+    defer gpa.free(head_text);
+    const head = Oid.parse(format, std.mem.trim(u8, head_text, " \t\r\n")) catch return null;
+
+    const owned_name = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned_name);
+    const path = try gpa.dupe(u8, worktreeOf(dotgit));
+    return .{ .name = owned_name, .path = path, .head = head };
+}
+
 /// The worktree directory a `gitdir` file points at, with the trailing
 /// `/.git` removed.
 fn readWorktreePath(gpa: Allocator, io: std.Io, admin: std.Io.Dir) Error![]u8 {
-    const raw = admin.readFileAlloc(io, "gitdir", gpa, .limited(std.Io.Dir.max_path_bytes)) catch
-        return error.IoFailed;
-    defer gpa.free(raw);
+    const dotgit = try readGitdirFile(gpa, io, admin) orelse return error.IoFailed;
+    defer gpa.free(dotgit);
+    return gpa.dupe(u8, worktreeOf(dotgit));
+}
 
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+/// The `.git` file path that `gitdir` names, owned by the caller. Null when
+/// the file cannot be read.
+fn readGitdirFile(gpa: Allocator, io: std.Io, admin: std.Io.Dir) Error!?[]u8 {
+    const raw = try tryReadFile(gpa, io, admin, "gitdir", std.Io.Dir.max_path_bytes) orelse return null;
+    defer gpa.free(raw);
+    return try gpa.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+fn worktreeOf(dotgit: []const u8) []const u8 {
     const suffix = "/.git";
-    const path = if (std.mem.endsWith(u8, trimmed, suffix))
-        trimmed[0 .. trimmed.len - suffix.len]
-    else
-        trimmed;
-    return gpa.dupe(u8, path);
+    if (std.mem.endsWith(u8, dotgit, suffix)) return dotgit[0 .. dotgit.len - suffix.len];
+    return dotgit;
+}
+
+/// Reads a small file, or returns null when it cannot be read. Allocation
+/// failure is still an error, so a full heap never looks like a stale worktree.
+fn tryReadFile(gpa: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, limit: usize) Error!?[]u8 {
+    return dir.readFileAlloc(io, sub_path, gpa, .limited(limit)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 fn requireClean(
@@ -511,4 +645,160 @@ test "remove refuses when worktree has a modified file and succeeds with force" 
 
     try testing.expectError(error.FileNotFound, fx.tmp.dir.openDir(io, "w", .{}));
     try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
+}
+
+test "prune removes an admin directory whose .git file is gone and returns 1" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+    try fx.tmp.dir.deleteFile(io, "w/.git");
+
+    try testing.expectEqual(@as(u32, 1), try prune(gpa, io, &fx.repo));
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
+}
+
+test "prune leaves a live worktree alone" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    try testing.expectEqual(@as(u32, 0), try prune(gpa, io, &fx.repo));
+    const admin = try fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{});
+    admin.close(io);
+}
+
+test "prune removes an admin directory when only the .git file was deleted" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+    try fx.tmp.dir.deleteFile(io, "w/.git");
+
+    try testing.expectEqual(@as(u32, 1), try prune(gpa, io, &fx.repo));
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/w", .{}));
+
+    try expectFileContains(io, worktree, "greeting.txt", "hello\n");
+}
+
+test "prune removes an admin directory that has no gitdir file" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.repo.layout.common_dir.createDirPath(io, "worktrees/broken");
+
+    try testing.expectEqual(@as(u32, 1), try prune(gpa, io, &fx.repo));
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees/broken", .{}));
+}
+
+test "prune drops worktrees/ once the last admin directory goes" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+    try fx.tmp.dir.deleteFile(io, "w/.git");
+
+    _ = try prune(gpa, io, &fx.repo);
+    try testing.expectError(error.FileNotFound, fx.repo.layout.common_dir.openDir(io, "worktrees", .{}));
+}
+
+test "list reports the name, path and head of a live worktree" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var tree_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &tree_entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+
+    const listed = try list(gpa, io, &fx.repo);
+    defer freeList(gpa, listed);
+
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqualStrings("w", listed[0].name);
+    try testing.expect(listed[0].head.eql(commit_oid));
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try worktree.realPath(io, &path_buf);
+    try testing.expectEqualStrings(path_buf[0..path_len], listed[0].path);
+}
+
+test "list skips an admin directory whose files cannot be read" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    const blob_oid = try fx.repo.odb.write(.blob, "hello\n", null);
+    var tree_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "greeting.txt", .oid = blob_oid }};
+    const tree_oid = try writeTree(gpa, &fx.repo.odb, &tree_entries);
+    const commit_oid = try writeCommit(gpa, &fx.repo.odb, tree_oid);
+
+    try fx.tmp.dir.createDirPath(io, "w");
+    const worktree = try fx.tmp.dir.openDir(io, "w", .{ .iterate = true });
+    defer worktree.close(io);
+
+    try add(gpa, io, &fx.repo, "w", worktree, commit_oid, .{}, null);
+    try fx.repo.layout.common_dir.createDirPath(io, "worktrees/broken");
+
+    const listed = try list(gpa, io, &fx.repo);
+    defer freeList(gpa, listed);
+
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqualStrings("w", listed[0].name);
 }

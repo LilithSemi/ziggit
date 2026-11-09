@@ -112,11 +112,15 @@ pub const DiffStatus = @import("ziggit-diff").Status;
 pub const DiffOptions = @import("ziggit-diff").Options;
 
 // Linked worktrees. Reading one already works through `Repository`; these
-// create and remove them.
+// create, remove, prune and list them.
 pub const worktreeAdd = @import("ziggit-worktree").add;
 pub const worktreeRemove = @import("ziggit-worktree").remove;
 pub const WorktreeAddOptions = @import("ziggit-worktree").AddOptions;
 pub const WorktreeRemoveOptions = @import("ziggit-worktree").RemoveOptions;
+pub const worktreePrune = @import("ziggit-worktree").prune;
+pub const worktreeList = @import("ziggit-worktree").list;
+pub const worktreeFreeList = @import("ziggit-worktree").freeList;
+pub const WorktreeEntry = @import("ziggit-worktree").Entry;
 
 pub const Submodule = @import("ziggit-submodule").Submodule;
 pub const parseGitmodules = @import("ziggit-submodule").parseGitmodules;
