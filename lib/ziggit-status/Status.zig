@@ -98,9 +98,9 @@ pub const Options = struct {
     head_tree: ?Oid = null,
 };
 
-/// Allocation budget for reading one worktree file to hash it, and for one
-/// tree object. Defensive ceilings, not spec limits.
-const max_file_len: usize = 1 << 30;
+/// Allocation budget for one tree object. A defensive ceiling, not a spec
+/// limit. A worktree file needs no such budget: it is hashed in chunks and
+/// never held whole.
 const max_tree_len: usize = 1 << 20;
 
 /// Compares HEAD, the index and `work_tree`.
@@ -149,7 +149,7 @@ pub fn status(
     }
 
     for (paths.keys(), paths.values()) |path, sides| {
-        const decided = try decide(gpa, io, work_tree, odb, f, path, sides);
+        const decided = try decide(io, work_tree, f, path, sides);
         if (decided.untracked == false and decided.worktree == .unchanged and decided.staged == .unchanged) continue;
         const owned = try gpa.dupe(u8, path);
         errdefer gpa.free(owned);
@@ -190,10 +190,8 @@ const WorktreeFile = struct { size: u64, mode: FileMode };
 const Decided = struct { untracked: bool, worktree: Worktree, staged: Staged };
 
 fn decide(
-    gpa: Allocator,
     io: std.Io,
     work_tree: std.Io.Dir,
-    odb: *Odb,
     f: Format,
     path: []const u8,
     sides: Sides,
@@ -217,7 +215,7 @@ fn decide(
         // Size is the cheap discriminator and settles most files. Only when
         // it matches is the content worth hashing.
         if (wt.size != idx.size) break :blk .modified;
-        const actual = try hashWorktreeFile(gpa, io, work_tree, odb, f, path);
+        const actual = try hashWorktreeFile(io, work_tree, f, path);
         break :blk if (actual.eql(idx.oid)) .unchanged else .modified;
     };
 
@@ -226,21 +224,25 @@ fn decide(
 
 /// Hashes the file's current bytes as a blob, without writing it. `status`
 /// answers a question; it does not change the object database to do so.
+///
+/// Reads in fixed-size chunks and feeds the hasher as it goes, so a file of
+/// any size works. Reading it whole instead needed a ceiling, and a tracked
+/// file above that ceiling failed where git succeeds.
 fn hashWorktreeFile(
-    gpa: Allocator,
     io: std.Io,
     work_tree: std.Io.Dir,
-    odb: *Odb,
     f: Format,
     path: []const u8,
 ) Error!Oid {
-    _ = odb;
-    const bytes = work_tree.readFileAlloc(io, path, gpa, .limited(max_file_len)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.IoFailed,
-    };
-    defer gpa.free(bytes);
-    return object_mod.loose.hash(f, .blob, bytes);
+    var file = work_tree.openFile(io, path, .{}) catch return error.IoFailed;
+    defer file.close(io);
+
+    const size = (file.stat(io) catch return error.IoFailed).size;
+
+    var read_buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    return object_mod.loose.hashStreaming(f, .blob, size, &reader.interface) catch
+        return error.IoFailed;
 }
 
 /// Flattens the tree at `tree_oid` into `paths`, recursing into subtrees.
@@ -550,4 +552,22 @@ test "tracked changes sort before untracked ones" {
     // tracked.
     try testing.expectEqualStrings("zzz-gone.txt", result.changes[0].path);
     try testing.expectEqualStrings("aaa-untracked.txt", result.changes[1].path);
+}
+
+test "a file larger than the read buffer hashes to what git would record" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    // Past the 64 KiB chunk the streaming hash reads, so the loop runs more
+    // than once and a bug in its bookkeeping shows up as a wrong id.
+    const big = try gpa.alloc(u8, 200 * 1024 + 7);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try fx.work.writeFile(io, .{ .sub_path = "big.bin", .data = big });
+
+    const expected = object_mod.loose.hash(.sha1, .blob, big);
+    const got = try hashWorktreeFile(io, fx.work, .sha1, "big.bin");
+    try testing.expect(got.eql(expected));
 }

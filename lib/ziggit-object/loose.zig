@@ -196,6 +196,34 @@ pub const loose = struct {
         hasher.update(payload);
         return hasher.final();
     }
+
+    /// Same id as `hash`, taking the payload from `r` in pieces instead of
+    /// from one buffer. For content too large to hold in memory, such as a
+    /// tracked file of any size that `ziggit-status` has to compare.
+    ///
+    /// `size` has to be the payload's real length, because it goes in the
+    /// header that is hashed first. Reading fewer bytes than `size`, or
+    /// more, gives an id for a different object.
+    pub fn hashStreaming(
+        f: Format,
+        kind: ObjectKind,
+        size: u64,
+        r: *std.Io.Reader,
+    ) std.Io.Reader.Error!Oid {
+        var hasher = Hasher.init(f);
+        var buf: [max_header_len]u8 = undefined;
+        hasher.update(headerBytes(&buf, kind, size));
+
+        var hashed: u64 = 0;
+        while (hashed < size) {
+            const chunk = try r.peekGreedy(1);
+            const want: usize = @intCast(@min(chunk.len, size - hashed));
+            hasher.update(chunk[0..want]);
+            r.toss(want);
+            hashed += want;
+        }
+        return hasher.final();
+    }
 };
 
 // Byte-exact vectors, hand verified against `git hash-object` and
