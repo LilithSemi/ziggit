@@ -139,7 +139,7 @@ pub const Repository = struct {
             // `config.gitdir` had never been set.
         }
         var head_buf: [max_head_peek_len]u8 = undefined;
-        config.branch = peekBranchName(io, layout.common_dir, &head_buf);
+        config.branch = peekBranchName(io, layout.git_dir, &head_buf);
 
         if (options.config.use_system) {
             if (options.system_config_path) |p| try addAbsoluteConfigFile(&config, io, .system, layout.common_dir, p, diag);
@@ -172,7 +172,7 @@ pub const Repository = struct {
         errdefer odb.deinit();
 
         const committer = options.committer orelse committerFromConfig(&config);
-        const refs = Store.init(gpa, io, layout.common_dir, format, committer);
+        const refs = Store.initWorktree(gpa, io, layout.common_dir, layout.git_dir, format, committer);
 
         return .{
             .layout = layout,
@@ -513,14 +513,14 @@ fn reportCorruptShallow(diag: ?*?Diagnostic, gpa: Allocator, detail: []const u8)
     core_mod.report(diag, gpa, .{ .kind = .corrupt_gitfile, .path = owned_path, .detail = owned_detail });
 }
 
-/// The branch name `common_dir`'s own `HEAD` names, when it holds a
+/// The branch name `git_dir`'s own `HEAD` names, when it holds a
 /// symbolic ref under `refs/heads/`; null for a detached HEAD, an unborn
 /// repository with no `HEAD` file yet, or anything else. Reads the file
 /// directly rather than through `ziggit-refs`, since this runs before
 /// `format` is chosen: a raw object id under `HEAD` needs no format to
 /// say "this is not a branch", the only thing this function reports.
-fn peekBranchName(io: std.Io, common_dir: std.Io.Dir, buf: *[max_head_peek_len]u8) ?[]const u8 {
-    const content = common_dir.readFile(io, "HEAD", buf) catch return null;
+fn peekBranchName(io: std.Io, git_dir: std.Io.Dir, buf: *[max_head_peek_len]u8) ?[]const u8 {
+    const content = git_dir.readFile(io, "HEAD", buf) catch return null;
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     const prefix = "ref: refs/heads/";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
@@ -1337,4 +1337,43 @@ test "a config that fails to parse is not left behind by createRemote" {
         "https://example.com/r.git",
         repo2.config.getString("remote.origin.url").?,
     );
+}
+
+test "head in a linked worktree is the worktree's, and its branches are shared" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const main_oid = "1111111111111111111111111111111111111111";
+    const wt_oid = "2222222222222222222222222222222222222222";
+
+    try tmp.dir.createDirPath(io, "main.git");
+    var common = try tmp.dir.openDir(io, "main.git", .{ .iterate = true });
+    defer common.close(io);
+    try buildMinimalRepo(io, common);
+    try common.writeFile(io, .{ .sub_path = "refs/heads/main", .data = main_oid ++ "\n" });
+
+    try tmp.dir.createDirPath(io, "main.git/worktrees/wt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.git/worktrees/wt/commondir", .data = "../..\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.git/worktrees/wt/HEAD", .data = wt_oid ++ "\n" });
+    try tmp.dir.createDirPath(io, "wt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "wt/.git", .data = "gitdir: ../main.git/worktrees/wt\n" });
+
+    var start = try tmp.dir.openDir(io, "wt", .{ .iterate = true });
+    defer start.close(io);
+    const layout = try discover(gpa, io, start, .{}, null);
+    var repo = try Repository.open(gpa, io, layout, .{}, null);
+    defer repo.deinit();
+
+    // The common HEAD is a symbolic ref to `refs/heads/main`, so reading it
+    // by mistake would resolve to `main_oid` rather than fail. That is what
+    // makes this assertion worth making: both reads succeed, and only the
+    // directory tells them apart.
+    var buf: [Oid.max_formatted_length]u8 = undefined;
+    const head = try repo.head(null);
+    try std.testing.expectEqualStrings(wt_oid, head.toHex(&buf));
+
+    const branch = try repo.refs.resolve("refs/heads/main", null);
+    try std.testing.expectEqualStrings(main_oid, branch.toHex(&buf));
 }

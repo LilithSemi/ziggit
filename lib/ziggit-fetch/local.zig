@@ -98,7 +98,7 @@ pub fn fetchLocal(
     // case a person is most likely to open with the git command later.
     if (options.update_refs) {
         if (options.remote_url) |url| {
-            try fetcher_mod.writeFetchHead(gpa, io, repo.layout.common_dir, repo.format, plan.updates, url);
+            try fetcher_mod.writeFetchHead(gpa, io, repo.layout.git_dir, repo.format, plan.updates, url);
         }
     }
 

@@ -791,7 +791,7 @@ fn statusCmd(
         return error.UsageError;
     };
 
-    var index = ziggit.WorktreeIndex.open(gpa, io, repo.layout.common_dir, repo.format) catch |err| switch (err) {
+    var index = ziggit.WorktreeIndex.open(gpa, io, repo.layout.git_dir, repo.format) catch |err| switch (err) {
         // No index yet is an empty index, not a fault: that is what a fresh
         // repository looks like before anything is staged.
         error.IndexNotFound => ziggit.WorktreeIndex{ .gpa = gpa, .entries = &.{} },

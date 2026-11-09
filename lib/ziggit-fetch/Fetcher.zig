@@ -259,7 +259,7 @@ pub fn fetchRemote(
     // writes no FETCH_HEAD for a dry run. Measured, not assumed.
     if (options.update_refs) {
         if (options.remote_url) |url| {
-            try writeFetchHead(gpa, io, repo.layout.common_dir, repo.format, plan.updates, url);
+            try writeFetchHead(gpa, io, repo.layout.git_dir, repo.format, plan.updates, url);
         }
     }
 
@@ -753,7 +753,7 @@ pub fn recordShallowBoundary(gpa: Allocator, io: std.Io, common_dir: std.Io.Dir,
 pub fn writeFetchHead(
     gpa: Allocator,
     io: std.Io,
-    common_dir: std.Io.Dir,
+    git_dir: std.Io.Dir,
     format: Format,
     plan_updates: []const remote_mod.PlannedUpdate,
     remote_url: []const u8,
@@ -775,7 +775,7 @@ pub fn writeFetchHead(
         out.writer.writeByte('\n') catch return error.OutOfMemory;
     }
 
-    common_dir.writeFile(io, .{ .sub_path = "FETCH_HEAD", .data = out.written() }) catch return error.IoFailed;
+    git_dir.writeFile(io, .{ .sub_path = "FETCH_HEAD", .data = out.written() }) catch return error.IoFailed;
 }
 
 /// Builds the description field of one FETCH_HEAD line. Each form below is

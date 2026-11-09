@@ -61,11 +61,18 @@ pub const Store = struct {
     gpa: Allocator,
     io: std.Io,
     /// Borrowed. The caller opens this before `init` and closes it after
-    /// `deinit`; `Store` never closes it itself. For a linked worktree this
-    /// is the common directory, not the per-worktree directory: this
-    /// module does not resolve that distinction, it only reads and writes
-    /// whatever directory it is given.
+    /// `deinit`; `Store` never closes it itself. Holds `refs/` and
+    /// `packed-refs`, which a linked worktree shares with the main
+    /// checkout.
     git_dir: std.Io.Dir,
+    /// Where a per-worktree ref lives: `HEAD` and the other root refs, and
+    /// `refs/bisect/`, `refs/worktree/` and `refs/rewritten/`. Equal to
+    /// `git_dir`, handle for handle, for a repository that is not a linked
+    /// worktree, so `init` sets both to the one directory it is given and
+    /// only `initWorktree` makes them differ. Borrowed, like `git_dir`.
+    ///
+    /// `isPerWorktree` decides which of the two a name belongs in.
+    worktree_dir: std.Io.Dir,
     format: Format,
     /// Who a reflog line written by this `Store` is attributed to. Null
     /// means this `Store` cannot attribute a write to anyone; a caller
@@ -122,7 +129,62 @@ pub const Store = struct {
     /// null `committer` only matters to a call that also passes a
     /// `reflog_message`, which then fails with `error.NoCommitterIdentity`.
     pub fn init(gpa: Allocator, io: std.Io, git_dir: std.Io.Dir, f: Format, committer: ?Committer) Store {
-        return .{ .gpa = gpa, .io = io, .git_dir = git_dir, .format = f, .committer = committer };
+        return initWorktree(gpa, io, git_dir, git_dir, f, committer);
+    }
+
+    /// Same as `init`, for a linked worktree, whose `HEAD` is its own while
+    /// its branches and tags are the main checkout's. `common_dir` holds
+    /// `refs/` and `packed-refs`; `worktree_dir` is the directory a `.git`
+    /// file's `gitdir:` line names.
+    ///
+    /// Passing one directory as both is what `init` does, and is right for
+    /// every repository that is not a linked worktree.
+    pub fn initWorktree(
+        gpa: Allocator,
+        io: std.Io,
+        common_dir: std.Io.Dir,
+        worktree_dir: std.Io.Dir,
+        f: Format,
+        committer: ?Committer,
+    ) Store {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .git_dir = common_dir,
+            .worktree_dir = worktree_dir,
+            .format = f,
+            .committer = committer,
+        };
+    }
+
+    /// Whether `name` belongs to one worktree rather than to the whole
+    /// repository. Two shapes qualify, both read off real git:
+    ///   - a root ref: a name with no `/` written only in capitals and
+    ///     underscores, such as `HEAD`, `ORIG_HEAD` or `MERGE_HEAD`. A
+    ///     top-level name in any other case, `lowercase` or `MiXeD`, is
+    ///     not one.
+    ///   - a name under `refs/bisect/`, `refs/worktree/` or
+    ///     `refs/rewritten/`. The prefix must be whole: `refs/bisecting/x`
+    ///     and `refs/worktreex/y` are shared, as is `refs/stash`.
+    /// Everything else, `refs/heads/`, `refs/tags/` and `refs/remotes/`
+    /// among it, is shared with every other worktree.
+    pub fn isPerWorktree(name: []const u8) bool {
+        if (std.mem.indexOfScalar(u8, name, '/') == null) {
+            if (name.len == 0) return false;
+            for (name) |c| {
+                if (!std.ascii.isUpper(c) and c != '_') return false;
+            }
+            return true;
+        }
+        for ([_][]const u8{ "refs/bisect/", "refs/worktree/", "refs/rewritten/" }) |prefix| {
+            if (std.mem.startsWith(u8, name, prefix)) return true;
+        }
+        return false;
+    }
+
+    /// The directory the ref named `name` lives in.
+    fn dirFor(s: *Store, name: []const u8) std.Io.Dir {
+        return if (isPerWorktree(name)) s.worktree_dir else s.git_dir;
     }
 
     /// Releases the packed-refs cache, if one was ever loaded; `git_dir`
@@ -143,7 +205,7 @@ pub const Store = struct {
             return err;
         };
 
-        const loose_target = loose_mod.read(s.gpa, s.git_dir, s.io, name, s.format) catch |err| {
+        const loose_target = loose_mod.read(s.gpa, s.dirFor(name), s.io, name, s.format) catch |err| {
             if (err == error.CorruptRefFile) try s.reportCorruptRef(diag, name);
             return err;
         };
@@ -355,11 +417,11 @@ pub const Store = struct {
         const lock_path = try loose_mod.lockPath(s.gpa, name);
         defer s.gpa.free(lock_path);
 
-        loose_mod.acquireLock(s.git_dir, s.io, lock_path) catch |err| {
+        loose_mod.acquireLock(s.dirFor(name), s.io, lock_path) catch |err| {
             if (err == error.LockContended) try s.reportLockContended(diag, lock_path);
             return err;
         };
-        errdefer s.releaseLockAndReport(lock_path, diag);
+        errdefer s.releaseLockAndReport(s.dirFor(name), lock_path, diag);
 
         const existing = try s.currentValue(name, diag);
         const ok = switch (mode) {
@@ -417,7 +479,7 @@ pub const Store = struct {
             const committer = s.committer.?;
             const seconds: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(s.io, .real).nanoseconds, std.time.ns_per_s));
             const identity = committer.at(seconds);
-            const reflog_offset = reflog_mod.append(s.gpa, s.git_dir, s.io, name, old_oid, new_oid, identity, msg) catch |err| switch (err) {
+            const reflog_offset = reflog_mod.append(s.gpa, s.dirFor(name), s.io, name, old_oid, new_oid, identity, msg) catch |err| switch (err) {
                 // `RevertFailed` means `append` already tried and failed to
                 // put the file back the way it was: the same fault as a
                 // failed `revert` below, just caught one step earlier.
@@ -429,8 +491,8 @@ pub const Store = struct {
                 error.IoFailed => return error.IoFailed,
                 error.OutOfMemory => return error.OutOfMemory,
             };
-            loose_mod.commitLock(s.git_dir, s.io, lock_path, name, content) catch |err| {
-                reflog_mod.revert(s.gpa, s.git_dir, s.io, name, reflog_offset) catch |revert_err| switch (revert_err) {
+            loose_mod.commitLock(s.dirFor(name), s.io, lock_path, name, content) catch |err| {
+                reflog_mod.revert(s.gpa, s.dirFor(name), s.io, name, reflog_offset) catch |revert_err| switch (revert_err) {
                     // Out of memory happened before `revert` even tried to
                     // touch the file; it is a fault of its own, not a
                     // report-and-continue case, so it takes precedence over
@@ -444,7 +506,7 @@ pub const Store = struct {
                 return err;
             };
         } else {
-            try loose_mod.commitLock(s.git_dir, s.io, lock_path, name, content);
+            try loose_mod.commitLock(s.dirFor(name), s.io, lock_path, name, content);
         }
     }
 
@@ -460,11 +522,11 @@ pub const Store = struct {
         const lock_path = try loose_mod.lockPath(s.gpa, name);
         defer s.gpa.free(lock_path);
 
-        loose_mod.acquireLock(s.git_dir, s.io, lock_path) catch |err| {
+        loose_mod.acquireLock(s.dirFor(name), s.io, lock_path) catch |err| {
             if (err == error.LockContended) try s.reportLockContended(diag, lock_path);
             return err;
         };
-        errdefer s.releaseLockAndReport(lock_path, diag);
+        errdefer s.releaseLockAndReport(s.dirFor(name), lock_path, diag);
 
         const existing = try s.currentValue(name, diag);
         switch (existing) {
@@ -475,11 +537,11 @@ pub const Store = struct {
             },
         }
 
-        s.git_dir.deleteFile(s.io, name) catch |err| {
+        s.dirFor(name).deleteFile(s.io, name) catch |err| {
             if (err != error.FileNotFound) return error.IoFailed;
         };
         try s.removeFromPackedRefs(name, diag);
-        s.releaseLockAndReport(lock_path, diag);
+        s.releaseLockAndReport(s.dirFor(name), lock_path, diag);
     }
 
     /// Points `name` at `target` unconditionally: no compare-and-swap,
@@ -498,7 +560,7 @@ pub const Store = struct {
         defer s.gpa.free(content);
 
         const stuck_before = s.stuck_lock_releases;
-        loose_mod.writeAtomic(s.gpa, s.git_dir, s.io, name, content, &s.stuck_lock_releases) catch |err| {
+        loose_mod.writeAtomic(s.gpa, s.dirFor(name), s.io, name, content, &s.stuck_lock_releases) catch |err| {
             if (s.stuck_lock_releases != stuck_before) s.reportStuckLockRelease(name, diag);
             if (err == error.LockContended) try s.reportLockContended(diag, name);
             return err;
@@ -607,7 +669,7 @@ pub const Store = struct {
     /// `.symbolic` means `name` exists but is not a value a compare and
     /// swap can match against.
     fn currentValue(s: *Store, name: []const u8, diag: ?*?Diagnostic) Error!Existing {
-        const loose_target = loose_mod.read(s.gpa, s.git_dir, s.io, name, s.format) catch |err| {
+        const loose_target = loose_mod.read(s.gpa, s.dirFor(name), s.io, name, s.format) catch |err| {
             if (err == error.CorruptRefFile) try s.reportCorruptRef(diag, name);
             return err;
         };
@@ -747,8 +809,12 @@ pub const Store = struct {
     /// removal itself fails: the lock file stays on disk, and every later
     /// `acquireLock` on the same name reports `LockContended` until an
     /// operator clears it by hand.
-    fn releaseLockAndReport(s: *Store, lock_path: []const u8, diag: ?*?Diagnostic) void {
-        if (loose_mod.releaseLock(s.git_dir, s.io, lock_path)) {
+    ///
+    /// `dir` is the one the lock was taken in, which the caller already
+    /// knows from the ref name. Deriving it here from `lock_path` would
+    /// get it wrong: `HEAD.lock` is not shaped like a root ref.
+    fn releaseLockAndReport(s: *Store, dir: std.Io.Dir, lock_path: []const u8, diag: ?*?Diagnostic) void {
+        if (loose_mod.releaseLock(dir, s.io, lock_path)) {
             s.stuck_lock_releases += 1;
             s.reportStuckLockRelease(lock_path, diag);
         }
@@ -1487,4 +1553,101 @@ test "setHeadDetached writes a reflog entry naming the id it moved to" {
     defer std.testing.allocator.free(log);
     try std.testing.expect(std.mem.indexOf(u8, log, "checkout: moving to a revision") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "444444444444444444444444444444444444444d") != null);
+}
+
+test "isPerWorktree splits the names real git keeps per worktree" {
+    const per_worktree = [_][]const u8{
+        "HEAD",             "ORIG_HEAD",           "MERGE_HEAD",
+        "CHERRY_PICK_HEAD", "REVERT_HEAD",         "FETCH_HEAD",
+        "BISECT_LOG",       "AUTO_MERGE",          "refs/bisect/bad",
+        "refs/worktree/w",  "refs/rewritten/onto",
+    };
+    for (per_worktree) |name| {
+        try std.testing.expect(Store.isPerWorktree(name));
+    }
+
+    // `lowercase` and `MiXeD` are shared: git takes a root ref only when
+    // the name is written in capitals and underscores. The three prefixes
+    // must match whole, so the near misses below are shared too.
+    const shared = [_][]const u8{
+        "refs/heads/main",   "refs/tags/v1",     "refs/remotes/origin/main",
+        "refs/stash",        "refs/bisecting/x", "refs/worktreex/y",
+        "refs/rewrittenx/z", "lowercase",        "MiXeD",
+        "",
+    };
+    for (shared) |name| {
+        try std.testing.expect(!Store.isPerWorktree(name));
+    }
+}
+
+test "a linked worktree reads its own HEAD and the shared branches" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "common/refs/heads");
+    try tmp.dir.createDirPath(io, "common/worktrees/wt");
+    var common = try tmp.dir.openDir(io, "common", .{ .iterate = true });
+    defer common.close(io);
+    var per_worktree = try tmp.dir.openDir(io, "common/worktrees/wt", .{ .iterate = true });
+    defer per_worktree.close(io);
+
+    const main_oid = "1111111111111111111111111111111111111111";
+    const wt_oid = "2222222222222222222222222222222222222222";
+    try common.writeFile(io, .{ .sub_path = "HEAD", .data = main_oid ++ "\n" });
+    try common.writeFile(io, .{ .sub_path = "refs/heads/main", .data = main_oid ++ "\n" });
+    try per_worktree.writeFile(io, .{ .sub_path = "HEAD", .data = wt_oid ++ "\n" });
+
+    var store = Store.initWorktree(gpa, io, common, per_worktree, .sha1, null);
+    defer store.deinit();
+
+    var buf: [Oid.max_formatted_length]u8 = undefined;
+    const head = try store.resolve("HEAD", null);
+    try std.testing.expectEqualStrings(wt_oid, head.toHex(&buf));
+
+    const branch = try store.resolve("refs/heads/main", null);
+    try std.testing.expectEqualStrings(main_oid, branch.toHex(&buf));
+
+    // `init` on the common directory alone is the ordinary repository, and
+    // must still see the common HEAD.
+    var plain = Store.init(gpa, io, common, .sha1, null);
+    defer plain.deinit();
+    const plain_head = try plain.resolve("HEAD", null);
+    try std.testing.expectEqualStrings(main_oid, plain_head.toHex(&buf));
+}
+
+test "a write to a linked worktree's HEAD lands in the worktree, not the common dir" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "common/refs/heads");
+    try tmp.dir.createDirPath(io, "common/worktrees/wt");
+    var common = try tmp.dir.openDir(io, "common", .{ .iterate = true });
+    defer common.close(io);
+    var per_worktree = try tmp.dir.openDir(io, "common/worktrees/wt", .{ .iterate = true });
+    defer per_worktree.close(io);
+
+    const main_oid = "1111111111111111111111111111111111111111";
+    const wt_oid = "2222222222222222222222222222222222222222";
+    try common.writeFile(io, .{ .sub_path = "HEAD", .data = main_oid ++ "\n" });
+
+    var store = Store.initWorktree(gpa, io, common, per_worktree, .sha1, null);
+    defer store.deinit();
+
+    try store.update("HEAD", try Oid.parse(.sha1, wt_oid), null, null, null);
+
+    const written = try per_worktree.readFileAlloc(io, "HEAD", gpa, .limited(128));
+    defer gpa.free(written);
+    try std.testing.expectEqualStrings(wt_oid ++ "\n", written);
+
+    // The main checkout's HEAD is untouched, and no lock file is left in
+    // either directory.
+    const untouched = try common.readFileAlloc(io, "HEAD", gpa, .limited(128));
+    defer gpa.free(untouched);
+    try std.testing.expectEqualStrings(main_oid ++ "\n", untouched);
+    try std.testing.expectError(error.FileNotFound, per_worktree.statFile(io, "HEAD.lock", .{}));
+    try std.testing.expectError(error.FileNotFound, common.statFile(io, "HEAD.lock", .{}));
 }
