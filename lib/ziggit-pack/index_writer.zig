@@ -301,11 +301,16 @@ test "the index records the pack's own trailing checksum, with deltas present" {
     const base_id = object_mod.loose.hash(f_sha1, .blob, base_payload);
     const patch = [_]u8{ 11, 5, 0x91, 0, 5 };
 
+    // Two deltas sharing one base. With a single delta the reader happens
+    // to finish on the trailer, so the fault does not show; resolving the
+    // second seeks backwards and leaves it short of the end.
     var built = try buildTestPack(gpa, f_sha1, &.{
         .{ .object = .{ .kind = .blob, .payload = base_payload } },
-        .{ .ref_delta = .{ .base_id = base_id, .patch = &patch } },
+        .{ .ofs_delta = .{ .base_index = 0, .patch = &patch } },
+        .{ .ofs_delta = .{ .base_index = 0, .patch = &patch } },
     });
     defer built.deinit(gpa);
+    _ = base_id;
 
     try tmp.dir.writeFile(io, .{ .sub_path = "p.pack", .data = built.bytes });
     var pack_file = try tmp.dir.openFile(io, "p.pack", .{});
