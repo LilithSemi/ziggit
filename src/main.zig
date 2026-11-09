@@ -844,8 +844,29 @@ fn worktreeCmd(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !void {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "prune")) {
+        var diag: ?Diagnostic = null;
+        const pruned = ziggit.worktreePrune(gpa, io, repo) catch |err| {
+            try reportDiag(gpa, stderr, "worktree prune", err, &diag, null);
+            return err;
+        };
+        try stdout.print("{d}\n", .{pruned});
+        return;
+    }
+
+    if (args.len == 1 and std.mem.eql(u8, args[0], "list")) {
+        var diag: ?Diagnostic = null;
+        const entries = ziggit.worktreeList(gpa, io, repo) catch |err| {
+            try reportDiag(gpa, stderr, "worktree list", err, &diag, null);
+            return err;
+        };
+        defer ziggit.worktreeFreeList(gpa, entries);
+        for (entries) |e| try stdout.print("{s} {f} [{s}]\n", .{ e.path, e.head, e.name });
+        return;
+    }
+
     if (args.len != 2) {
-        try stderr.writeAll("usage: ziggit worktree (add|remove) <path>\n");
+        try stderr.writeAll("usage: ziggit worktree (add|remove) <path>, or (list|prune)\n");
         return error.UsageError;
     }
     const verb = args[0];
@@ -893,6 +914,6 @@ fn worktreeCmd(
         return;
     }
 
-    try stderr.writeAll("usage: ziggit worktree (add|remove) <path>\n");
+    try stderr.writeAll("usage: ziggit worktree (add|remove) <path>, or (list|prune)\n");
     return error.UsageError;
 }
