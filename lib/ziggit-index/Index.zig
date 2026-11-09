@@ -132,6 +132,17 @@ fn mapSize(err: error{ AccessDenied, Canceled, PermissionDenied, Streaming, Syst
 pub const Index = struct {
     gpa: Allocator,
     entries: []const Entry, // owned
+    /// The `index` file's own stat, or null for an index built in memory
+    /// that was never read from disk.
+    ///
+    /// `ziggit-status` needs the mtime for git's racily-clean rule. An
+    /// entry whose own mtime is not strictly older than the index file's
+    /// could have been written inside the same filesystem timestamp tick
+    /// as the index itself, so its stat block cannot prove the file is
+    /// unchanged and the content has to be read. Without this, trusting
+    /// the stat block turns a file edited in that tick into a wrong
+    /// answer rather than a slow one.
+    file_stat: ?Stat = null,
 
     const signature = "DIRC";
     const min_version = 2;
@@ -234,7 +245,16 @@ pub const Index = struct {
 
         try skipExtensionsAndChecksum(r, &reader, oid_len);
 
-        return .{ .gpa = gpa, .entries = try list.toOwnedSlice(gpa) };
+        // Stat the handle this was read from, not the path: a concurrent
+        // git could have replaced `index` by now, and the mtime that the
+        // racily-clean rule needs is the one belonging to the bytes above.
+        const file_stat: ?Stat = if (file.stat(io)) |s| statFromFile(s) else |_| null;
+
+        return .{
+            .gpa = gpa,
+            .entries = try list.toOwnedSlice(gpa),
+            .file_stat = file_stat,
+        };
     }
 
     pub fn deinit(i: *Index) void {

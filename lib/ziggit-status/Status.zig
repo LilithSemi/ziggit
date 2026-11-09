@@ -132,7 +132,12 @@ pub fn status(
         } else {
             gop.value_ptr.* = .{};
         }
-        gop.value_ptr.index = .{ .oid = e.oid, .mode = e.mode, .size = e.size };
+        gop.value_ptr.index = .{
+            .oid = e.oid,
+            .mode = e.mode,
+            .size = e.size,
+            .stat = e.stat,
+        };
     }
 
     if (options.head_tree) |tree_oid| {
@@ -149,7 +154,7 @@ pub fn status(
     }
 
     for (paths.keys(), paths.values()) |path, sides| {
-        const decided = try decide(io, work_tree, f, path, sides);
+        const decided = try decide(io, work_tree, f, path, sides, index.file_stat);
         if (decided.untracked == false and decided.worktree == .unchanged and decided.staged == .unchanged) continue;
         const owned = try gpa.dupe(u8, path);
         errdefer gpa.free(owned);
@@ -174,7 +179,14 @@ pub fn status(
     return .{ .changes = owned };
 }
 
-const Entry = struct { oid: Oid, mode: FileMode, size: u32 };
+const Entry = struct {
+    oid: Oid,
+    mode: FileMode,
+    size: u32,
+    /// The index entry's own stat block, or null for an entry that came
+    /// from a tree, which has none and never needs one.
+    stat: ?index_mod.Stat = null,
+};
 
 /// What each of the three sides says about one path. A side that never
 /// mentioned it stays null, which is how "absent here" is told apart from
@@ -185,7 +197,11 @@ const Sides = struct {
     worktree: ?WorktreeFile = null,
 };
 
-const WorktreeFile = struct { size: u64, mode: FileMode };
+const WorktreeFile = struct {
+    size: u64,
+    mode: FileMode,
+    stat: index_mod.Stat,
+};
 
 const Decided = struct { untracked: bool, worktree: Worktree, staged: Staged };
 
@@ -195,6 +211,7 @@ fn decide(
     f: Format,
     path: []const u8,
     sides: Sides,
+    index_stat: ?index_mod.Stat,
 ) Error!Decided {
     // Neither the index nor HEAD has ever heard of it.
     if (sides.index == null and sides.head == null) {
@@ -211,15 +228,64 @@ fn decide(
     const worktree: Worktree = blk: {
         const idx = sides.index orelse break :blk .unchanged;
         const wt = sides.worktree orelse break :blk .deleted;
+        const racily_clean = isRacilyClean(idx, index_stat);
         if (wt.mode != idx.mode) break :blk .modified;
-        // Size is the cheap discriminator and settles most files. Only when
-        // it matches is the content worth hashing.
+        // Size is the cheap discriminator and settles most files.
         if (wt.size != idx.size) break :blk .modified;
+        // Then the stat cache: a file whose mtime still matches what the
+        // index recorded has not been written since, so its content needs
+        // no reading. This is what keeps `status` proportional to what
+        // changed rather than to how much the repository tracks.
+        if (!racily_clean and statUnchanged(idx.stat, wt.stat)) break :blk .unchanged;
         const actual = try hashWorktreeFile(io, work_tree, f, path);
         break :blk if (actual.eql(idx.oid)) .unchanged else .modified;
     };
 
     return .{ .untracked = false, .worktree = worktree, .staged = staged };
+}
+
+/// Whether the index entry's stat block is too fresh to be believed.
+///
+/// Git calls this racily clean: an entry whose mtime is not strictly older
+/// than the `index` file's own could have been written inside the same
+/// filesystem timestamp tick as the index, in which case a later write in
+/// that same tick leaves the mtime unchanged. Its content has to be read.
+///
+/// A null `index_stat` is an index with no file behind it, built in memory
+/// or by a caller that never read one, so nothing can date its entries and
+/// every one of them is treated as racy.
+fn isRacilyClean(idx: Entry, index_stat: ?index_mod.Stat) bool {
+    const file = index_stat orelse return true;
+    const recorded = idx.stat orelse return true;
+    if (recorded.mtime_seconds != file.mtime_seconds) return recorded.mtime_seconds > file.mtime_seconds;
+    return recorded.mtime_nanoseconds >= file.mtime_nanoseconds;
+}
+
+/// Whether the file's stat block says it has not been written since the
+/// index recorded it.
+///
+/// Compares ctime as well as mtime, which is what git does and what makes
+/// the answer right: `touch` can put an mtime back to any value, so an
+/// equal-size edit followed by a restored mtime reads as clean on mtime
+/// alone. Only ctime moves on a write and cannot be set by hand, and git
+/// reports such a file modified. The inode goes in for the same reason: a
+/// path replaced by a different file is a change whatever its timestamps
+/// say.
+///
+/// `dev`, `uid` and `gid` are left out because `statFromFile` cannot fill
+/// them; see its own note. Leaving a field out of this comparison only
+/// costs a needless hash, never a wrong answer, so the three absent ones
+/// are safe to skip while the three present ones are worth comparing.
+/// A null `recorded` answers false, so the content gets read. The index
+/// side always carries a stat, so nothing reaches this today; false is the
+/// answer that costs a hash rather than a wrong column if that changes.
+fn statUnchanged(recorded: ?index_mod.Stat, current: index_mod.Stat) bool {
+    const r = recorded orelse return false;
+    return r.mtime_seconds == current.mtime_seconds and
+        r.mtime_nanoseconds == current.mtime_nanoseconds and
+        r.ctime_seconds == current.ctime_seconds and
+        r.ctime_nanoseconds == current.ctime_nanoseconds and
+        r.ino == current.ino;
 }
 
 /// Hashes the file's current bytes as a blob, without writing it. `status`
@@ -349,7 +415,11 @@ fn collectWorktree(
                 } else {
                     gop.value_ptr.* = .{};
                 }
-                gop.value_ptr.worktree = .{ .size = stat.size, .mode = mode };
+                gop.value_ptr.worktree = .{
+                    .size = stat.size,
+                    .mode = mode,
+                    .stat = index_mod.statFromFile(stat),
+                };
             },
             else => {},
         }
@@ -554,6 +624,80 @@ test "tracked changes sort before untracked ones" {
     try testing.expectEqualStrings("aaa-untracked.txt", result.changes[1].path);
 }
 
+test "a file whose whole stat block still matches is not hashed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const stat = index_mod.statFromFile(try fx.work.statFile(io, "a.txt", .{}));
+
+    // A deliberately wrong oid. Hashing the file would disagree with it and
+    // report `modified`, so `unchanged` can only mean the stat cache was
+    // trusted and the content never read.
+    var entry = indexEntry("a.txt", try Oid.parse(.sha1, "0000000000000000000000000000000000000000"), .blob, 6);
+    entry.stat = stat;
+    var entries = [_]index_mod.Entry{entry};
+
+    const index: Index = .{ .gpa = gpa, .entries = &entries, .file_stat = newerThan(stat) };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    // With no HEAD given every index entry reads as newly staged, so the
+    // worktree column is what this asserts on, not the number of changes.
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.unchanged, result.changes[0].worktree);
+}
+
+test "a racily clean entry is hashed even though its mtime matches" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const stat = index_mod.statFromFile(try fx.work.statFile(io, "a.txt", .{}));
+
+    var entry = indexEntry("a.txt", try Oid.parse(.sha1, "0000000000000000000000000000000000000000"), .blob, 6);
+    entry.stat = stat;
+    var entries = [_]index_mod.Entry{entry};
+
+    // The index file's own mtime equal to the entry's makes the entry racy:
+    // the file could have been written in the same tick as the index, so the
+    // stat block proves nothing and the content has to be read.
+    const index: Index = .{ .gpa = gpa, .entries = &entries, .file_stat = stat };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.modified, result.changes[0].worktree);
+}
+
+test "a changed file is still reported when its mtime moved" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const stat = index_mod.statFromFile(try fx.work.statFile(io, "a.txt", .{}));
+
+    // Same size, right oid for the old content, but an mtime one second
+    // behind what the file now carries. The cache misses and the hash wins.
+    var entry = indexEntry("a.txt", object_mod.loose.hash(.sha1, .blob, "HELLO\n"), .blob, 6);
+    entry.stat = stat;
+    entry.stat.mtime_seconds -= 1;
+    var entries = [_]index_mod.Entry{entry};
+
+    const index: Index = .{ .gpa = gpa, .entries = &entries, .file_stat = newerThan(stat) };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.modified, result.changes[0].worktree);
+}
+
 test "a file larger than the read buffer hashes to what git would record" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -570,4 +714,60 @@ test "a file larger than the read buffer hashes to what git would record" {
     const expected = object_mod.loose.hash(.sha1, .blob, big);
     const got = try hashWorktreeFile(io, fx.work, .sha1, "big.bin");
     try testing.expect(got.eql(expected));
+}
+
+/// A copy of `s` with its mtime one second later, for an index file written
+/// after the entries it holds.
+fn newerThan(s: index_mod.Stat) index_mod.Stat {
+    var out = s;
+    out.mtime_seconds += 1;
+    return out;
+}
+
+test "a matching mtime with a stale ctime is still hashed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const stat = index_mod.statFromFile(try fx.work.statFile(io, "a.txt", .{}));
+
+    // Right mtime, right size, wrong ctime. `touch` can put an mtime back to
+    // any value but cannot touch ctime, so this is the shape an equal-size
+    // edit leaves behind, and git reports it modified. Comparing mtime alone
+    // would call it clean and give the wrong answer.
+    var entry = indexEntry("a.txt", object_mod.loose.hash(.sha1, .blob, "HELLO\n"), .blob, 6);
+    entry.stat = stat;
+    entry.stat.ctime_seconds -= 1;
+    var entries = [_]index_mod.Entry{entry};
+
+    const index: Index = .{ .gpa = gpa, .entries = &entries, .file_stat = newerThan(stat) };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.modified, result.changes[0].worktree);
+}
+
+test "a path whose inode changed is hashed even with every timestamp intact" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var fx = try Fixture.init(gpa, io);
+    defer fx.deinit();
+
+    try fx.work.writeFile(io, .{ .sub_path = "a.txt", .data = "hello\n" });
+    const stat = index_mod.statFromFile(try fx.work.statFile(io, "a.txt", .{}));
+
+    var entry = indexEntry("a.txt", object_mod.loose.hash(.sha1, .blob, "HELLO\n"), .blob, 6);
+    entry.stat = stat;
+    entry.stat.ino +%= 1;
+    var entries = [_]index_mod.Entry{entry};
+
+    const index: Index = .{ .gpa = gpa, .entries = &entries, .file_stat = newerThan(stat) };
+    var result = try status(gpa, io, fx.work, &fx.odb, index, .sha1, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 1), result.changes.len);
+    try testing.expectEqual(Worktree.modified, result.changes[0].worktree);
 }
