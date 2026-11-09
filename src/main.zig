@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "diff", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "checkout", "diff", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -123,6 +123,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
     const rest = args[1..];
     if (std.mem.eql(u8, cmd, "cat-file")) {
         try catFile(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "checkout")) {
+        try checkoutCmd(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "diff")) {
         try diffCmd(gpa, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "ls-tree")) {
@@ -916,4 +918,55 @@ fn worktreeCmd(
 
     try stderr.writeAll("usage: ziggit worktree (add|remove) <path>, or (list|prune)\n");
     return error.UsageError;
+}
+
+/// `ziggit checkout <treeish> [--sync-from <treeish>]`, the one shape this
+/// library needs for a fast-forward: write the target tree over the working
+/// tree, and with `--sync-from` also drop what the old tree named and the
+/// new one does not.
+fn checkoutCmd(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const usage = "usage: ziggit checkout <treeish> [--sync-from <treeish>]\n";
+    if (args.len != 1 and args.len != 3) {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    }
+    if (args.len == 3 and !std.mem.eql(u8, args[1], "--sync-from")) {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    }
+
+    const worktree = repo.layout.work_tree orelse {
+        try stderr.writeAll("ziggit: checkout needs a working tree\n");
+        return error.UsageError;
+    };
+
+    var diag: ?Diagnostic = null;
+    const target = resolveTreeish(gpa, repo, args[0], &diag) catch |err| {
+        try reportDiag(gpa, stderr, "checkout", err, &diag, args[0]);
+        return err;
+    };
+
+    var sync_from: ?Oid = null;
+    if (args.len == 3) {
+        sync_from = resolveTreeish(gpa, repo, args[2], &diag) catch |err| {
+            try reportDiag(gpa, stderr, "checkout", err, &diag, args[2]);
+            return err;
+        };
+    }
+
+    ziggit.checkoutTree(gpa, io, &repo.odb, worktree, target, .{
+        .force = true,
+        .sync_from = sync_from,
+    }, &diag) catch |err| {
+        try reportDiag(gpa, stderr, "checkout", err, &diag, args[0]);
+        return err;
+    };
+    try stdout.print("HEAD is now at {f}\n", .{target});
 }

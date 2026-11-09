@@ -106,6 +106,25 @@ pub const Strategy = struct {
     /// git directory, a value that was wrong and harmless only because the
     /// option defaulted off.
     write_index_to: ?std.Io.Dir = null,
+    /// The tree the worktree already holds, or null to compare against
+    /// nothing. Null is the default.
+    ///
+    /// With a tree given, a path that tree names and `tree_oid` does not
+    /// is deleted, and a directory left empty by those deletions is
+    /// removed as well. This is what a fast-forward needs, and it is
+    /// narrower than `remove_untracked`: a file no tree ever named stays,
+    /// so uncommitted and ignored work survives the move. A directory
+    /// still holding one such file stays too, with only the tracked
+    /// entries inside it gone.
+    ///
+    /// A gitlink is never removed. The directory belongs to another
+    /// repository, so dropping the entry leaves the submodule's own
+    /// checkout in place, the same as git.
+    ///
+    /// Naming the old tree is the permission; `force` does not gate it.
+    /// The caller states what the worktree holds, and a worktree that
+    /// holds something else is the caller's to find out about first.
+    sync_from: ?Oid = null,
 };
 
 pub const Error = error{ PathEscapesWorktree, NameReservedForCheckout, NameReservedForRepository, NameTooLong, IoFailed } || Odb.Error || Allocator.Error || index_mod.Error;
@@ -138,6 +157,10 @@ pub fn checkoutTree(
     diag: ?*?Diagnostic,
 ) Error!void {
     try checkoutInto(gpa, io, odb, worktree, tree_oid, strategy, diag);
+
+    if (strategy.sync_from) |old_tree_oid| {
+        try syncRemovals(gpa, io, odb, worktree, old_tree_oid, tree_oid, diag);
+    }
 
     const git_dir = strategy.write_index_to orelse return;
 
@@ -226,6 +249,93 @@ fn checkoutInto(
     }
 
     if (strategy.remove_untracked) try removeUntracked(gpa, io, worktree, tree);
+}
+
+/// A parsed tree together with the object bytes it was parsed from.
+/// `Tree.parse` points every entry name into those bytes rather than
+/// copying it, so the two have one lifetime and `deinit` ends both.
+const OwnedTree = struct {
+    bytes: []u8,
+    tree: Tree,
+
+    fn deinit(self: *OwnedTree, gpa: Allocator) void {
+        self.tree.deinit(gpa);
+        gpa.free(self.bytes);
+    }
+};
+
+fn readTree(gpa: Allocator, odb: *Odb, tree_oid: Oid, diag: ?*?Diagnostic) Error!OwnedTree {
+    const bytes = try odb.readAlloc(gpa, tree_oid, max_tree_object_len, diag);
+    errdefer gpa.free(bytes);
+
+    const tree = Tree.parse(gpa, odb.format, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CorruptTree => {
+            reportCorrupt(diag, gpa, "tree object is corrupt");
+            return error.CorruptObject;
+        },
+    };
+    return .{ .bytes = bytes, .tree = tree };
+}
+
+/// Deletes what `old_tree_oid` named and `new_tree_oid` does not, one
+/// directory at a time. `new_tree_oid` is null for a directory the new tree
+/// dropped whole.
+///
+/// A dropped directory is walked rather than handed to `deleteTree`,
+/// because an untracked file inside it has to survive. The walk removes
+/// only the names the old tree listed and then asks for the directory
+/// itself; `DirNotEmpty` means something untracked is still in there, and
+/// keeping the directory is the answer git gives too.
+fn syncRemovals(
+    gpa: Allocator,
+    io: std.Io,
+    odb: *Odb,
+    dir: std.Io.Dir,
+    old_tree_oid: Oid,
+    new_tree_oid: ?Oid,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var old = try readTree(gpa, odb, old_tree_oid, diag);
+    defer old.deinit(gpa);
+
+    var new: ?OwnedTree = if (new_tree_oid) |oid| try readTree(gpa, odb, oid, diag) else null;
+    defer if (new) |*n| n.deinit(gpa);
+
+    for (old.tree.entries) |entry| {
+        try validateEntryName(entry.name);
+        const kept = if (new) |n| n.tree.find(entry.name) else null;
+
+        if (entry.mode == .tree) {
+            // A kept name of any other kind means `checkoutInto` has
+            // already put a file or a symlink here, so no directory of the
+            // old tree's is left to walk.
+            if (kept) |k| if (k.mode != .tree) continue;
+            if (try statExisting(dir, io, entry.name) != .directory) continue;
+
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch return error.IoFailed;
+            defer sub.close(io);
+            try syncRemovals(gpa, io, odb, sub, entry.oid, if (kept) |k| k.oid else null, diag);
+
+            if (kept == null) {
+                dir.deleteDir(io, entry.name) catch |err| switch (err) {
+                    error.DirNotEmpty, error.FileNotFound => {},
+                    else => return error.IoFailed,
+                };
+            }
+            continue;
+        }
+
+        if (kept != null) continue;
+        // A submodule's checkout belongs to another repository, which is
+        // the one that removes it.
+        if (entry.mode == .gitlink) continue;
+
+        switch (try statExisting(dir, io, entry.name)) {
+            .file, .symlink => dir.deleteFile(io, entry.name) catch return error.IoFailed,
+            .absent, .directory, .other => {},
+        }
+    }
 }
 
 /// Collects one index entry per blob and symlink the tree names, at any
@@ -887,7 +997,6 @@ test "remove_untracked never deletes .git" {
     defer gpa.free(head_bytes);
     try std.testing.expectEqualStrings("ref: refs/heads/main\n", head_bytes);
 }
-
 // suspicious
 
 test "a blob with CRLF in it is written byte for byte, with no filtering" {
@@ -1280,4 +1389,157 @@ test "checkoutTree writes an index naming exactly what the tree named" {
     try std.testing.expect(index.find("untracked.txt") == null);
     // And each entry carries a stat block from the file checkout just wrote.
     try std.testing.expect(index.entries[0].stat.mtime_seconds != 0);
+}
+
+test "sync_from deletes a path the old tree named and the new tree does not" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try TestRepo.open(gpa, io, tmp.dir);
+    defer repo.deinit(io);
+
+    const dropped = try repo.odb.write(.blob, "gone\n", null);
+    const stays = try repo.odb.write(.blob, "here\n", null);
+    var old_entries = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "dropped.txt", .oid = dropped },
+        .{ .mode = .blob, .name = "stays.txt", .oid = stays },
+    };
+    const old_tree = try writeTree(gpa, &repo.odb, &old_entries);
+
+    var new_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "stays.txt", .oid = stays }};
+    const new_tree = try writeTree(gpa, &repo.odb, &new_entries);
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, old_tree, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, new_tree, .{
+        .force = true,
+        .sync_from = old_tree,
+    }, null);
+
+    try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "dropped.txt", .{}));
+    const bytes = try readAllAlloc(gpa, io, repo.worktree, "stays.txt");
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("here\n", bytes);
+}
+
+test "sync_from leaves a file no tree ever named" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try TestRepo.open(gpa, io, tmp.dir);
+    defer repo.deinit(io);
+
+    const dropped = try repo.odb.write(.blob, "gone\n", null);
+    var old_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "dropped.txt", .oid = dropped }};
+    const old_tree = try writeTree(gpa, &repo.odb, &old_entries);
+
+    const stays = try repo.odb.write(.blob, "here\n", null);
+    var new_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "stays.txt", .oid = stays }};
+    const new_tree = try writeTree(gpa, &repo.odb, &new_entries);
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, old_tree, populate, null);
+    try repo.worktree.writeFile(io, .{ .sub_path = "mine.txt", .data = "uncommitted\n" });
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, new_tree, .{
+        .force = true,
+        .sync_from = old_tree,
+    }, null);
+
+    try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "dropped.txt", .{}));
+    const bytes = try readAllAlloc(gpa, io, repo.worktree, "mine.txt");
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("uncommitted\n", bytes);
+}
+
+test "sync_from removes a directory it emptied, and keeps one still holding a file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try TestRepo.open(gpa, io, tmp.dir);
+    defer repo.deinit(io);
+
+    const blob = try repo.odb.write(.blob, "x\n", null);
+    var emptied_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "only.txt", .oid = blob }};
+    const emptied = try writeTree(gpa, &repo.odb, &emptied_entries);
+    var occupied_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "only.txt", .oid = blob }};
+    const occupied = try writeTree(gpa, &repo.odb, &occupied_entries);
+
+    var old_entries = [_]Tree.Entry{
+        .{ .mode = .tree, .name = "emptied", .oid = emptied },
+        .{ .mode = .tree, .name = "occupied", .oid = occupied },
+    };
+    const old_tree = try writeTree(gpa, &repo.odb, &old_entries);
+
+    const keeper = try repo.odb.write(.blob, "k\n", null);
+    var new_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "root.txt", .oid = keeper }};
+    const new_tree = try writeTree(gpa, &repo.odb, &new_entries);
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, old_tree, populate, null);
+    try repo.worktree.writeFile(io, .{ .sub_path = "occupied/mine.txt", .data = "uncommitted\n" });
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, new_tree, .{
+        .force = true,
+        .sync_from = old_tree,
+    }, null);
+
+    try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "emptied", .{}));
+    try std.testing.expectError(error.FileNotFound, repo.worktree.statFile(io, "occupied/only.txt", .{}));
+    const bytes = try readAllAlloc(gpa, io, repo.worktree, "occupied/mine.txt");
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("uncommitted\n", bytes);
+}
+
+test "sync_from leaves a submodule's own checkout in place" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try TestRepo.open(gpa, io, tmp.dir);
+    defer repo.deinit(io);
+
+    const commit_oid = try repo.odb.write(.blob, "pretend commit\n", null);
+    var old_entries = [_]Tree.Entry{.{ .mode = .gitlink, .name = "sub", .oid = commit_oid }};
+    const old_tree = try writeTree(gpa, &repo.odb, &old_entries);
+
+    const blob = try repo.odb.write(.blob, "x\n", null);
+    var new_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "root.txt", .oid = blob }};
+    const new_tree = try writeTree(gpa, &repo.odb, &new_entries);
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, old_tree, populate, null);
+    try repo.worktree.writeFile(io, .{ .sub_path = "sub/tracked-by-the-submodule.txt", .data = "theirs\n" });
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, new_tree, .{
+        .force = true,
+        .sync_from = old_tree,
+    }, null);
+
+    const bytes = try readAllAlloc(gpa, io, repo.worktree, "sub/tracked-by-the-submodule.txt");
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("theirs\n", bytes);
+}
+
+test "a checkout with no sync_from deletes nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var repo = try TestRepo.open(gpa, io, tmp.dir);
+    defer repo.deinit(io);
+
+    const dropped = try repo.odb.write(.blob, "gone\n", null);
+    var old_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "dropped.txt", .oid = dropped }};
+    const old_tree = try writeTree(gpa, &repo.odb, &old_entries);
+
+    const stays = try repo.odb.write(.blob, "here\n", null);
+    var new_entries = [_]Tree.Entry{.{ .mode = .blob, .name = "stays.txt", .oid = stays }};
+    const new_tree = try writeTree(gpa, &repo.odb, &new_entries);
+
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, old_tree, populate, null);
+    try checkoutTree(gpa, io, &repo.odb, repo.worktree, new_tree, .{ .force = true }, null);
+
+    const bytes = try readAllAlloc(gpa, io, repo.worktree, "dropped.txt");
+    defer gpa.free(bytes);
+    try std.testing.expectEqualStrings("gone\n", bytes);
 }
