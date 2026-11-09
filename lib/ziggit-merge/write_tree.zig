@@ -53,6 +53,10 @@ pub fn writeTree(
     // f.txt left in tree" when ours deleted it. The marked content replaces
     // that side's oid where the merge produced some.
     for (result.conflicts) |conflict| {
+        // A rename conflict's content is already in the tree under the new
+        // name, so its old path contributes nothing. Git writes only the
+        // destinations for these two.
+        if (conflict.kind == .rename_rename or conflict.kind == .rename_delete) continue;
         const side = stageEntry(result.index, conflict.path, .ours) orelse
             stageEntry(result.index, conflict.path, .theirs) orelse continue;
         var out = side;

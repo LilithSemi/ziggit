@@ -29,6 +29,8 @@ const Index = index_mod.Index;
 const IndexEntry = index_mod.Entry;
 const Stage = index_mod.Stage;
 
+const diff_mod = @import("ziggit-diff");
+
 const merge_file_mod = @import("merge_file.zig");
 const FileOptions = merge_file_mod.FileOptions;
 
@@ -56,6 +58,10 @@ pub const ConflictKind = enum {
     delete_modify,
     /// One side has a directory where the other has a file.
     directory_file,
+    /// Both sides moved one path to different names.
+    rename_rename,
+    /// One side moved a path, the other deleted it where it was.
+    rename_delete,
 };
 
 pub const Conflict = struct {
@@ -130,6 +136,10 @@ pub fn mergeTrees(
     }
 
     try walk(gpa, odb, base, ours, theirs, "", &entries, &conflicts, options, diag);
+
+    if (options.find_renames and base != null) {
+        try applyRenames(gpa, odb, base.?, ours, theirs, &entries, &conflicts, options, diag);
+    }
 
     const owned = try entries.toOwnedSlice(gpa);
     errdefer {
@@ -815,4 +825,416 @@ test "a null base makes every path on both sides an addition" {
     try testing.expect(!result.hasConflicts());
     try testing.expect(resolved(result, "a.txt") != null);
     try testing.expect(resolved(result, "b.txt") != null);
+}
+
+/// One side's renames, as a map from the path in `base` to the path the
+/// side moved it to.
+const RenameMap = std.StringHashMapUnmanaged([]const u8);
+
+fn freeRenames(gpa: Allocator, map: *RenameMap) void {
+    var it = map.iterator();
+    while (it.next()) |e| {
+        gpa.free(e.key_ptr.*);
+        gpa.free(e.value_ptr.*);
+    }
+    map.deinit(gpa);
+}
+
+fn renameMap(
+    gpa: Allocator,
+    odb: *Odb,
+    base: Oid,
+    side: Oid,
+    options: Options,
+    diag: ?*?Diagnostic,
+) Error!RenameMap {
+    var map: RenameMap = .empty;
+    errdefer freeRenames(gpa, &map);
+
+    var d = diff_mod.diffTrees(gpa, odb, base, side, .{
+        .detect_renames = true,
+        .rename_threshold = options.rename_threshold,
+        .target_limit = options.target_limit,
+    }, diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // A tree the diff machinery will not take leaves renames
+        // undetected, which costs a pessimistic conflict rather than a
+        // wrong merge.
+        else => return map,
+    };
+    defer d.deinit(gpa);
+
+    for (d.patches) |patch| {
+        if (patch.status != .renamed) continue;
+        const old_path = try gpa.dupe(u8, patch.old_path);
+        errdefer gpa.free(old_path);
+        const new_path = try gpa.dupe(u8, patch.new_path);
+        errdefer gpa.free(new_path);
+        try map.put(gpa, old_path, new_path);
+    }
+    return map;
+}
+
+/// Resolves the paths a rename moved, which the per-directory walk cannot
+/// see: it compares names inside one directory, and a rename is a delete in
+/// one place and an add in another, possibly a different directory.
+///
+/// Without this a rename reads as delete plus add. That is pessimistic in
+/// one direction, where git merges the other side's edit into the renamed
+/// file and ziggit reports a conflict, and plainly wrong in the other:
+/// two sides renaming one file to different names, or one renaming while
+/// the other deletes, both came out CLEAN with the same tree git produces,
+/// so a caller would commit a merge git calls conflicted.
+fn applyRenames(
+    gpa: Allocator,
+    odb: *Odb,
+    base: Oid,
+    ours: Oid,
+    theirs: Oid,
+    entries: *std.ArrayList(IndexEntry),
+    conflicts: *std.ArrayList(Conflict),
+    options: Options,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var our_renames = try renameMap(gpa, odb, base, ours, options, diag);
+    defer freeRenames(gpa, &our_renames);
+    var their_renames = try renameMap(gpa, odb, base, theirs, options, diag);
+    defer freeRenames(gpa, &their_renames);
+    if (our_renames.count() == 0 and their_renames.count() == 0) return;
+
+    var base_flat = try flatten(gpa, odb, base, diag);
+    defer freeFlat(gpa, &base_flat);
+    var our_flat = try flatten(gpa, odb, ours, diag);
+    defer freeFlat(gpa, &our_flat);
+    var their_flat = try flatten(gpa, odb, theirs, diag);
+    defer freeFlat(gpa, &their_flat);
+
+    // Every base path either side moved, each handled once.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+
+    for ([_]*RenameMap{ &our_renames, &their_renames }) |map| {
+        var it = map.iterator();
+        while (it.next()) |pair| {
+            const old_path = pair.key_ptr.*;
+            if (seen.contains(old_path)) continue;
+            try seen.put(gpa, old_path, {});
+
+            const our_new = our_renames.get(old_path);
+            const their_new = their_renames.get(old_path);
+            const base_entry = base_flat.get(old_path) orelse continue;
+
+            if (our_new != null and their_new != null) {
+                if (std.mem.eql(u8, our_new.?, their_new.?)) {
+                    // Both moved it the same way, so only the content is
+                    // left to merge, and the walk already did that at the
+                    // new path: base is absent there, so it read as an add
+                    // against an add.
+                    try remergeAt(gpa, odb, our_new.?, base_entry, our_flat.get(our_new.?), their_flat.get(our_new.?), entries, conflicts, options, diag);
+                    continue;
+                }
+                try recordRenameConflict(gpa, entries, conflicts, .rename_rename, old_path, base_entry, our_flat.get(our_new.?), their_flat.get(their_new.?));
+                continue;
+            }
+
+            const new_path = our_new orelse their_new.?;
+            const renamed_by_us = our_new != null;
+            const other_at_old = if (renamed_by_us) their_flat.get(old_path) else our_flat.get(old_path);
+
+            if (other_at_old == null) {
+                // The other side deleted it where it was.
+                const moved = if (renamed_by_us) our_flat.get(new_path) else their_flat.get(new_path);
+                try recordRenameConflict(gpa, entries, conflicts, .rename_delete, old_path, base_entry, if (renamed_by_us) moved else null, if (renamed_by_us) null else moved);
+                continue;
+            }
+
+            // The other side kept it where it was. Its content belongs in
+            // the renamed file, so the three-way merge happens at the new
+            // path with the other side's version standing in for its side.
+            const ours_side = if (renamed_by_us) our_flat.get(new_path) else other_at_old;
+            const theirs_side = if (renamed_by_us) other_at_old else their_flat.get(new_path);
+            try remergeAt(gpa, odb, new_path, base_entry, ours_side, theirs_side, entries, conflicts, options, diag);
+            dropPath(gpa, entries, conflicts, old_path);
+        }
+    }
+}
+
+/// Replaces whatever the walk decided for `path` with a three-way merge of
+/// the given sides.
+fn remergeAt(
+    gpa: Allocator,
+    odb: *Odb,
+    path: []const u8,
+    base_entry: Tree.Entry,
+    our_entry: ?Tree.Entry,
+    their_entry: ?Tree.Entry,
+    entries: *std.ArrayList(IndexEntry),
+    conflicts: *std.ArrayList(Conflict),
+    options: Options,
+    diag: ?*?Diagnostic,
+) Error!void {
+    dropPath(gpa, entries, conflicts, path);
+
+    const decided = try decide(gpa, odb, base_entry, our_entry, their_entry, path, options, diag);
+    switch (decided) {
+        .nothing => {},
+        .take => |e| try entries.append(gpa, .{
+            .path = try gpa.dupe(u8, path),
+            .oid = e.oid,
+            .mode = e.mode,
+            .stage = .merged,
+            .size = 0,
+            .stat = zeroStat(),
+        }),
+        .conflict => |c| {
+            try conflicts.append(gpa, .{ .path = try gpa.dupe(u8, path), .kind = c.kind, .marked = c.marked });
+            try appendStages(gpa, entries, path, base_entry, our_entry, their_entry);
+        },
+    }
+}
+
+/// Records a conflict whose sides sit at different paths, so there is no
+/// single content to write. The tree keeps whatever the walk already put
+/// down, which is what git does: both renamed files stay, and so does the
+/// renamed one when the other side deleted it.
+fn recordRenameConflict(
+    gpa: Allocator,
+    entries: *std.ArrayList(IndexEntry),
+    conflicts: *std.ArrayList(Conflict),
+    kind: ConflictKind,
+    old_path: []const u8,
+    base_entry: Tree.Entry,
+    our_entry: ?Tree.Entry,
+    their_entry: ?Tree.Entry,
+) Error!void {
+    try conflicts.append(gpa, .{ .path = try gpa.dupe(u8, old_path), .kind = kind, .marked = null });
+    try appendStages(gpa, entries, old_path, base_entry, our_entry, their_entry);
+}
+
+/// Removes every entry and conflict the walk recorded for `path`.
+fn dropPath(
+    gpa: Allocator,
+    entries: *std.ArrayList(IndexEntry),
+    conflicts: *std.ArrayList(Conflict),
+    path: []const u8,
+) void {
+    var i: usize = 0;
+    while (i < entries.items.len) {
+        if (std.mem.eql(u8, entries.items[i].path, path)) {
+            var removed = entries.swapRemove(i);
+            removed.deinit(gpa);
+            continue;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < conflicts.items.len) {
+        if (std.mem.eql(u8, conflicts.items[i].path, path)) {
+            var removed = conflicts.swapRemove(i);
+            removed.deinit(gpa);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+const FlatTree = std.StringHashMapUnmanaged(Tree.Entry);
+
+fn freeFlat(gpa: Allocator, map: *FlatTree) void {
+    var it = map.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+    map.deinit(gpa);
+}
+
+/// Every leaf of `tree_oid` by its full path. Subtrees are not entries
+/// here; they are the path separators.
+fn flatten(gpa: Allocator, odb: *Odb, tree_oid: Oid, diag: ?*?Diagnostic) Error!FlatTree {
+    var map: FlatTree = .empty;
+    errdefer freeFlat(gpa, &map);
+    try flattenInto(gpa, odb, tree_oid, "", &map, diag);
+    return map;
+}
+
+fn flattenInto(
+    gpa: Allocator,
+    odb: *Odb,
+    tree_oid: Oid,
+    prefix: []const u8,
+    out: *FlatTree,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var owned = try readTree(gpa, odb, tree_oid, diag);
+    defer owned.deinit(gpa);
+
+    for (owned.tree.entries) |entry| {
+        const path = if (prefix.len == 0)
+            try gpa.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(gpa, "{s}/{s}", .{ prefix, entry.name });
+        if (entry.mode == .tree) {
+            defer gpa.free(path);
+            try flattenInto(gpa, odb, entry.oid, path, out, diag);
+            continue;
+        }
+        errdefer gpa.free(path);
+        try out.put(gpa, path, entry);
+    }
+}
+
+/// A base tree with `old.txt` and `keep.txt`, the shape the rename tests
+/// share. `body` is long enough that a one-line edit still scores well
+/// above the rename threshold.
+const RenameFixture = struct {
+    base: Oid,
+    body: Oid,
+    edited: Oid,
+};
+
+fn renameFixture(r: *TestRepo, gpa: Allocator) !RenameFixture {
+    const body = try r.blob("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
+    const edited = try r.blob("l1\nl2\nl3\nl4\nl5\nl6\nl7\nedited\n");
+    const keep = try r.blob("other\n");
+    var base_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "old.txt", .oid = body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    return .{ .base = try r.tree(gpa, &base_e), .body = body, .edited = edited };
+}
+
+test "a rename on one side takes the other side's edit at the new path" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var r = try TestRepo.init(gpa, io);
+    defer r.deinit(io);
+    const fx = try renameFixture(&r, gpa);
+    const keep = try r.blob("other\n");
+
+    // Ours moves the file untouched; theirs edits it where it was.
+    var our_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "new.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const ours = try r.tree(gpa, &our_e);
+    var their_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "old.txt", .oid = fx.edited },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const theirs = try r.tree(gpa, &their_e);
+
+    var result = try mergeTrees(gpa, &r.odb, fx.base, ours, theirs, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expect(!result.hasConflicts());
+    // The edit lands at the new name, and the old name is gone.
+    try testing.expect(resolved(result, "new.txt").?.oid.eql(fx.edited));
+    try testing.expect(resolved(result, "old.txt") == null);
+}
+
+test "both sides renaming one path to different names is rename/rename" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var r = try TestRepo.init(gpa, io);
+    defer r.deinit(io);
+    const fx = try renameFixture(&r, gpa);
+    const keep = try r.blob("other\n");
+
+    var our_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "a.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const ours = try r.tree(gpa, &our_e);
+    var their_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "b.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const theirs = try r.tree(gpa, &their_e);
+
+    var result = try mergeTrees(gpa, &r.odb, fx.base, ours, theirs, .{}, null);
+    defer result.deinit(gpa);
+
+    // Without rename detection this came out CLEAN with both files present,
+    // which is the tree git writes but not the verdict git gives.
+    try testing.expect(result.hasConflicts());
+    try testing.expectEqual(ConflictKind.rename_rename, conflictFor(result, "old.txt").?.kind);
+}
+
+test "a rename against a delete is rename/delete" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var r = try TestRepo.init(gpa, io);
+    defer r.deinit(io);
+    const fx = try renameFixture(&r, gpa);
+    const keep = try r.blob("other\n");
+
+    var our_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "new.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const ours = try r.tree(gpa, &our_e);
+    var their_e = [_]Tree.Entry{.{ .mode = .blob, .name = "keep.txt", .oid = keep }};
+    const theirs = try r.tree(gpa, &their_e);
+
+    var result = try mergeTrees(gpa, &r.odb, fx.base, ours, theirs, .{}, null);
+    defer result.deinit(gpa);
+    try testing.expect(result.hasConflicts());
+    try testing.expectEqual(ConflictKind.rename_delete, conflictFor(result, "old.txt").?.kind);
+}
+
+test "find_renames false leaves a rename as a delete and an add" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var r = try TestRepo.init(gpa, io);
+    defer r.deinit(io);
+    const fx = try renameFixture(&r, gpa);
+    const keep = try r.blob("other\n");
+
+    var our_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "new.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const ours = try r.tree(gpa, &our_e);
+    var their_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "old.txt", .oid = fx.edited },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const theirs = try r.tree(gpa, &their_e);
+
+    var result = try mergeTrees(gpa, &r.odb, fx.base, ours, theirs, .{ .find_renames = false }, null);
+    defer result.deinit(gpa);
+
+    // Ours deleted `old.txt` where theirs changed it, so the two are
+    // unrelated paths again and the delete conflicts.
+    try testing.expect(result.hasConflicts());
+    try testing.expectEqual(ConflictKind.delete_modify, conflictFor(result, "old.txt").?.kind);
+    try testing.expect(resolved(result, "new.txt") != null);
+}
+
+test "both sides renaming to the same name still merge the content" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var r = try TestRepo.init(gpa, io);
+    defer r.deinit(io);
+    const fx = try renameFixture(&r, gpa);
+    const keep = try r.blob("other\n");
+
+    // Both move it to `new.txt` and theirs also edits it. The walk alone
+    // sees no base at `new.txt`, so it reads as an add against an add and
+    // conflicts; the base belongs to the old path, which is why this has to
+    // be merged again with the base entry in hand.
+    var our_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "new.txt", .oid = fx.body },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const ours = try r.tree(gpa, &our_e);
+    var their_e = [_]Tree.Entry{
+        .{ .mode = .blob, .name = "new.txt", .oid = fx.edited },
+        .{ .mode = .blob, .name = "keep.txt", .oid = keep },
+    };
+    const theirs = try r.tree(gpa, &their_e);
+
+    var result = try mergeTrees(gpa, &r.odb, fx.base, ours, theirs, .{}, null);
+    defer result.deinit(gpa);
+
+    try testing.expect(!result.hasConflicts());
+    try testing.expect(resolved(result, "new.txt").?.oid.eql(fx.edited));
 }

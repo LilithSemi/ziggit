@@ -1073,6 +1073,8 @@ fn conflictLabel(kind: ziggit.MergeConflictKind) []const u8 {
         .modify_delete => "modify/delete",
         .delete_modify => "modify/delete",
         .directory_file => "directory/file",
+        .rename_rename => "rename/rename",
+        .rename_delete => "rename/delete",
     };
 }
 
