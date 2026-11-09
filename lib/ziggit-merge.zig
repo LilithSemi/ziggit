@@ -9,6 +9,7 @@
 const merge_file_mod = @import("ziggit-merge/merge_file.zig");
 const merge_trees_mod = @import("ziggit-merge/merge_trees.zig");
 const write_tree_mod = @import("ziggit-merge/write_tree.zig");
+const virtual_base_mod = @import("ziggit-merge/virtual_base.zig");
 
 pub const Error = merge_file_mod.Error;
 pub const Input = merge_file_mod.Input;
@@ -24,8 +25,12 @@ pub const Result = merge_trees_mod.Result;
 pub const mergeTrees = merge_trees_mod.mergeTrees;
 pub const writeTree = write_tree_mod.writeTree;
 
+pub const CommitError = virtual_base_mod.Error;
+pub const mergeCommits = virtual_base_mod.mergeCommits;
+
 test {
     _ = merge_file_mod;
     _ = merge_trees_mod;
     _ = write_tree_mod;
+    _ = virtual_base_mod;
 }
