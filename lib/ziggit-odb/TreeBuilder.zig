@@ -268,12 +268,6 @@ fn buildAndWriteTrees(gpa: Allocator, odb: *Odb, trees: *TreeMap, diag: ?*?Diagn
     return error.OutOfMemory;
 }
 
-fn comparePathDepth(_: void, a: []const u8, b: []const u8) bool {
-    const depth_a = countSlashes(a);
-    const depth_b = countSlashes(b);
-    return depth_a < depth_b;
-}
-
 fn countSlashes(path: []const u8) usize {
     var count: usize = 0;
     for (path) |c| {
@@ -282,14 +276,23 @@ fn countSlashes(path: []const u8) usize {
     return count;
 }
 
+/// Orders directories deepest first, so every subdirectory is written
+/// before the directory that names it and its real id is known by then.
+///
+/// This read `<` and so wrote parents first, which left a nested directory
+/// entry holding the zero id `addDirectoryEntries` puts there as a
+/// placeholder. One level deep happened to work, because the only parent
+/// was the root and it sorted last anyway; two levels produced a tree git
+/// could not read.
 fn pathDepthComparator(_: void, a: []const u8, b: []const u8) bool {
     const depth_a = countSlashes(a);
     const depth_b = countSlashes(b);
-    if (depth_a != depth_b) return depth_a < depth_b;
-    // If same depth, root ("") comes last
-    if (a.len == 0) return false; // a is root, comes after b
-    if (b.len == 0) return true; // b is root, comes after a
-    return false; // otherwise maintain order
+    if (depth_a != depth_b) return depth_a > depth_b;
+    // The root is shallower than any named directory of the same slash
+    // count, so it goes last.
+    if (a.len == 0) return false;
+    if (b.len == 0) return true;
+    return false;
 }
 
 // Tests
@@ -504,9 +507,14 @@ test "a path several levels deep produces nested trees" {
         .entries = entries.items,
     };
 
-    _ = try writeTreeFromIndex(gpa, &odb, index_obj, null);
+    const written = try writeTreeFromIndex(gpa, &odb, index_obj, null);
 
-    // TODO: Verify that 4 tree objects were created (one for each level a, b, c, and the root)
+    // Git's own id for a tree holding only `a/b/c/d.txt` with "hello\n" in
+    // it. An id this matches can only come from every nested tree being
+    // written correctly, which is what the earlier version of this test,
+    // discarding the result, never checked.
+    var buf: [Oid.max_formatted_length]u8 = undefined;
+    try std.testing.expectEqualStrings("5d11c0002e25f49797a57e4ba70cb1f1302009be", written.toHex(&buf));
 }
 
 test "an unmerged entry is refused" {
