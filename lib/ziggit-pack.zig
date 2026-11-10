@@ -22,6 +22,11 @@ pub const Index = index_mod.Index;
 const index_writer_mod = @import("ziggit-pack/index_writer.zig");
 pub const writeIndex = index_writer_mod.writeIndex;
 
+const pack_writer_mod = @import("ziggit-pack/pack_writer.zig");
+pub const PackWriterError = pack_writer_mod.Error;
+pub const ObjectSource = pack_writer_mod.Source;
+pub const writePack = pack_writer_mod.writePack;
+
 /// Test-only surface, kept apart from the real API above so the intent is
 /// explicit at the call site. Exported so a later module's own tests (a
 /// fetch strategy that must feed `writeIndex` a real received pack, for
@@ -40,4 +45,5 @@ test {
     _ = delta_mod;
     _ = index_mod;
     _ = index_writer_mod;
+    _ = pack_writer_mod;
 }
