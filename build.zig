@@ -356,6 +356,28 @@ pub fn build(b: *std.Build) void {
     });
     addModuleTests(b, test_step, fetch);
 
+    // Sending to a remote: the object set a push must carry, the pack
+    // writer's object source, and receive-pack's own v1 grammar.
+    const push = b.addModule("ziggit-push", .{
+        .root_source_file = b.path("lib/ziggit-push.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-object", .module = object },
+            .{ .name = "ziggit-pack", .module = pack },
+            .{ .name = "ziggit-odb", .module = odb },
+            .{ .name = "ziggit-refs", .module = refs },
+            .{ .name = "ziggit-repo", .module = repo },
+            .{ .name = "ziggit-proto", .module = proto },
+            .{ .name = "ziggit-transport", .module = transport },
+            .{ .name = "ziggit-pktline", .module = pktline },
+            .{ .name = "ziggit-revwalk", .module = revwalk },
+        },
+    });
+    addModuleTests(b, test_step, push);
+
     // Submodules: parsing `.gitmodules`, and fetching and checking out
     // every submodule a tree records, recursively. It composes fetch,
     // checkout, config, repo, and odb rather than adding a new layer any
