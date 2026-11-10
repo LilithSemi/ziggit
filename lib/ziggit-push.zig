@@ -5,6 +5,17 @@
 //! advertisement, the ref update commands and the status report live in
 //! this module instead.
 
+const protocol_mod = @import("ziggit-push/protocol.zig");
+pub const ProtocolError = protocol_mod.Error;
+pub const Advertisement = protocol_mod.Advertisement;
+pub const Ref = protocol_mod.Ref;
+pub const Command = protocol_mod.Command;
+pub const Report = protocol_mod.Report;
+pub const RefStatus = protocol_mod.RefStatus;
+pub const readAdvertisement = protocol_mod.readAdvertisement;
+pub const writeCommands = protocol_mod.writeCommands;
+pub const readReport = protocol_mod.readReport;
+
 const objects_mod = @import("ziggit-push/objects.zig");
 pub const ObjectsError = objects_mod.Error;
 pub const collectObjects = objects_mod.collect;
@@ -12,4 +23,5 @@ pub const OdbSource = objects_mod.OdbSource;
 
 test {
     _ = objects_mod;
+    _ = protocol_mod;
 }
