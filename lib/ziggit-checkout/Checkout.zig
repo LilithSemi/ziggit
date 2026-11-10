@@ -85,6 +85,8 @@ const odb_mod = @import("ziggit-odb");
 const Odb = odb_mod.Odb;
 
 const index_mod = @import("ziggit-index");
+
+const attr_mod = @import("ziggit-attr");
 const Index = index_mod.Index;
 const IndexEntry = index_mod.Entry;
 
@@ -125,9 +127,41 @@ pub const Strategy = struct {
     /// The caller states what the worktree holds, and a worktree that
     /// holds something else is the caller's to find out about first.
     sync_from: ?Oid = null,
+    /// Whether content filters run. `.none` is the default and stays the
+    /// default: one consumer of this library hashes the committed blob
+    /// bytes as a build input, and a filter rewriting a byte on the way
+    /// out would turn that hash into a wrong one.
+    filters: Filters = .none,
+    /// `core.autocrlf` and `core.eol`, which sit under the attributes and
+    /// decide line endings for a path no attribute speaks for. Read only
+    /// when `filters` is `.apply`. A caller maps `core.eol=native` to
+    /// `.lf` before it gets here.
+    core: attr_mod.CoreConfig = .{},
 };
 
-pub const Error = error{ PathEscapesWorktree, NameReservedForCheckout, NameReservedForRepository, NameTooLong, IoFailed } || Odb.Error || Allocator.Error || index_mod.Error;
+pub const Filters = enum {
+    /// Bytes land exactly as committed.
+    none,
+    /// Apply what pure computation can: line endings, `$Id$`, and the
+    /// `working-tree-encoding` conversions that need no charset library.
+    /// A path naming a clean or smudge driver is refused rather than
+    /// written unfiltered.
+    apply,
+};
+
+pub const Error = error{
+    PathEscapesWorktree,
+    NameReservedForCheckout,
+    NameReservedForRepository,
+    NameTooLong,
+    IoFailed,
+    /// The path names a `filter=` clean or smudge driver, whose config
+    /// value is a shell command string. This library runs no subprocess,
+    /// so it cannot apply one. Git LFS is this mechanism. Git itself fails
+    /// loudly when a required filter's tool is missing, and writing the
+    /// unfiltered content is the one answer neither tool gives.
+    UnsupportedFilter,
+} || Odb.Error || Allocator.Error || index_mod.Error || attr_mod.EncodingError || attr_mod.FromTreeError;
 
 /// Writes the tree at `tree_oid` into `worktree`.
 ///
@@ -156,7 +190,16 @@ pub fn checkoutTree(
     strategy: Strategy,
     diag: ?*?Diagnostic,
 ) Error!void {
-    try checkoutInto(gpa, io, odb, worktree, tree_oid, strategy, diag);
+    var filtering: ?Filtering = null;
+    defer if (filtering) |*f| f.attrs.deinit();
+    if (strategy.filters == .apply) {
+        filtering = .{
+            .attrs = try attr_mod.fromTree(gpa, odbReader(odb), odb.format, tree_oid),
+            .core = strategy.core,
+        };
+    }
+
+    try checkoutInto(gpa, io, odb, worktree, tree_oid, "", if (filtering) |*f| f else null, strategy, diag);
 
     if (strategy.sync_from) |old_tree_oid| {
         try syncRemovals(gpa, io, odb, worktree, old_tree_oid, tree_oid, diag);
@@ -206,12 +249,21 @@ const reserved_tmp_name = ".ziggit-checkout.tmp";
 /// refused as an entry name for all of them alike.
 const tmp_name_prefix = reserved_tmp_name ++ ".";
 
+/// The attribute rules one checkout follows, loaded from the tree it is
+/// writing, together with the config that sits under them.
+const Filtering = struct {
+    attrs: attr_mod.Attributes,
+    core: attr_mod.CoreConfig,
+};
+
 fn checkoutInto(
     gpa: Allocator,
     io: std.Io,
     odb: *Odb,
     worktree: std.Io.Dir,
     tree_oid: Oid,
+    path_prefix: []const u8,
+    filtering: ?*const Filtering,
     strategy: Strategy,
     diag: ?*?Diagnostic,
 ) Error!void {
@@ -241,9 +293,9 @@ fn checkoutInto(
     for (tree.entries) |entry| {
         try validateEntryName(entry.name);
         switch (entry.mode) {
-            .tree => try checkoutSubtree(gpa, io, odb, worktree, entry, strategy, diag),
+            .tree => try checkoutSubtree(gpa, io, odb, worktree, entry, path_prefix, filtering, strategy, diag),
             .gitlink => try checkoutGitlink(io, worktree, entry, strategy),
-            .blob, .blob_executable => try checkoutBlob(gpa, io, odb, worktree, entry, strategy, diag, tmp_name),
+            .blob, .blob_executable => try checkoutBlob(gpa, io, odb, worktree, entry, path_prefix, filtering, strategy, diag, tmp_name),
             .symlink => try checkoutSymlink(gpa, io, odb, worktree, entry, strategy, diag),
         }
     }
@@ -609,9 +661,43 @@ fn reportCorrupt(diag: ?*?Diagnostic, gpa: Allocator, detail: []const u8) void {
     core_mod.report(diag, gpa, .{ .kind = .corrupt_object, .path = null, .detail = dup });
 }
 
-fn checkoutBlob(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry: Tree.Entry, strategy: Strategy, diag: ?*?Diagnostic, tmp_name: []const u8) Error!void {
+fn checkoutBlob(
+    gpa: Allocator,
+    io: std.Io,
+    odb: *Odb,
+    dir: std.Io.Dir,
+    entry: Tree.Entry,
+    path_prefix: []const u8,
+    filtering: ?*const Filtering,
+    strategy: Strategy,
+    diag: ?*?Diagnostic,
+    tmp_name: []const u8,
+) Error!void {
     const existing = try statExisting(dir, io, entry.name);
     if (decide(existing, .file, strategy) == .skip) return;
+
+    // The plan is worked out before anything on disk is touched, so a
+    // path naming a driver this cannot run leaves the worktree as it was
+    // rather than half written.
+    var smudge: ?SmudgePlan = null;
+    if (filtering) |f| {
+        const path = try joinPath(gpa, path_prefix, entry.name);
+        defer gpa.free(path);
+        const p = attr_mod.plan(f.attrs.lookup(path), f.core);
+        if (p.filter) |driver| {
+            reportUnsupportedFilter(diag, gpa, path, driver);
+            return error.UnsupportedFilter;
+        }
+        var encoding: ?attr_mod.Encoding = null;
+        if (p.encoding) |name| {
+            encoding = attr_mod.Encoding.parse(name) orelse {
+                reportUnsupportedEncoding(diag, gpa, path, name);
+                return error.UnsupportedEncoding;
+            };
+        }
+        smudge = .{ .plan = p, .encoding = encoding };
+    }
+
     if (existing != .absent) try clearExisting(dir, io, entry.name, existing);
 
     {
@@ -619,14 +705,18 @@ fn checkoutBlob(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry: T
         errdefer dir.deleteFile(io, tmp_name) catch {};
         defer file.close(io);
 
-        var write_buf: [8192]u8 = undefined;
-        var fw = file.writer(io, &write_buf);
-        const kind = try odb.read(entry.oid, &fw.interface, diag);
-        if (kind != .blob) {
-            reportCorrupt(diag, gpa, "tree entry names a blob but the object is not one");
-            return error.CorruptObject;
+        if (smudge) |s| {
+            try writeSmudged(gpa, io, odb, file, entry, s, diag);
+        } else {
+            var write_buf: [8192]u8 = undefined;
+            var fw = file.writer(io, &write_buf);
+            const kind = try odb.read(entry.oid, &fw.interface, diag);
+            if (kind != .blob) {
+                reportCorrupt(diag, gpa, "tree entry names a blob but the object is not one");
+                return error.CorruptObject;
+            }
+            fw.end() catch return error.IoFailed;
         }
-        fw.end() catch return error.IoFailed;
 
         if (entry.mode == .blob_executable) {
             file.setPermissions(io, @fromBackingInt(@intCast(0o755))) catch return error.IoFailed;
@@ -677,7 +767,17 @@ fn checkoutSymlink(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry
     dir.symLink(io, obj.bytes, entry.name, .{}) catch return error.IoFailed;
 }
 
-fn checkoutSubtree(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry: Tree.Entry, strategy: Strategy, diag: ?*?Diagnostic) Error!void {
+fn checkoutSubtree(
+    gpa: Allocator,
+    io: std.Io,
+    odb: *Odb,
+    dir: std.Io.Dir,
+    entry: Tree.Entry,
+    path_prefix: []const u8,
+    filtering: ?*const Filtering,
+    strategy: Strategy,
+    diag: ?*?Diagnostic,
+) Error!void {
     const existing = try statExisting(dir, io, entry.name);
     if (decide(existing, .directory, strategy) == .skip) return;
     if (existing != .absent and existing != .directory) try clearExisting(dir, io, entry.name, existing);
@@ -691,7 +791,20 @@ fn checkoutSubtree(gpa: Allocator, io: std.Io, odb: *Odb, dir: std.Io.Dir, entry
     var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch return error.IoFailed;
     defer sub.close(io);
 
-    try checkoutInto(gpa, io, odb, sub, entry.oid, strategy, diag);
+    // The prefix is only needed when there are attributes to look a path
+    // up in, so a default checkout allocates nothing for it.
+    if (filtering == null) {
+        try checkoutInto(gpa, io, odb, sub, entry.oid, "", null, strategy, diag);
+        return;
+    }
+    const sub_prefix = try joinPath(gpa, path_prefix, entry.name);
+    defer gpa.free(sub_prefix);
+    try checkoutInto(gpa, io, odb, sub, entry.oid, sub_prefix, filtering, strategy, diag);
+}
+
+fn joinPath(gpa: Allocator, prefix: []const u8, name: []const u8) Allocator.Error![]u8 {
+    if (prefix.len == 0) return gpa.dupe(u8, name);
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ prefix, name });
 }
 
 /// A gitlink names a commit in another repository, one this `Odb` has
@@ -1541,4 +1654,125 @@ test "a checkout with no sync_from deletes nothing" {
     const bytes = try readAllAlloc(gpa, io, repo.worktree, "dropped.txt");
     defer gpa.free(bytes);
     try std.testing.expectEqualStrings("gone\n", bytes);
+}
+
+/// One path's resolved smudge rules, worked out before any write starts.
+const SmudgePlan = struct {
+    plan: attr_mod.Plan,
+    encoding: ?attr_mod.Encoding,
+};
+
+/// Allocation budget for one blob read whole so it can be filtered. A path
+/// past this is refused rather than written unfiltered, because writing it
+/// unfiltered is the answer that silently lies about the bytes.
+const max_filtered_blob_len: usize = 256 << 20;
+
+/// Writes `entry`'s blob through the smudge direction.
+///
+/// The order is git's, measured: line endings and `$Id$` act on the UTF-8
+/// the blob holds, and the encoding conversion is the outermost step on
+/// the worktree side.
+fn writeSmudged(
+    gpa: Allocator,
+    io: std.Io,
+    odb: *Odb,
+    file: std.Io.File,
+    entry: Tree.Entry,
+    s: SmudgePlan,
+    diag: ?*?Diagnostic,
+) Error!void {
+    const info = try odb.stat(entry.oid);
+    if (info.kind != .blob) {
+        reportCorrupt(diag, gpa, "tree entry names a blob but the object is not one");
+        return error.CorruptObject;
+    }
+
+    var content = try odb.readAlloc(gpa, entry.oid, max_filtered_blob_len, diag);
+    defer gpa.free(content);
+
+    if (s.plan.worktree_eol == .crlf and
+        attr_mod.smudgeTranslates(s.plan.kind, content))
+    {
+        if (try attr_mod.smudgeLineEndings(gpa, content)) |converted| {
+            gpa.free(content);
+            content = converted;
+        }
+    }
+
+    if (s.plan.ident) {
+        if (try attr_mod.smudgeIdent(gpa, content, entry.oid)) |expanded| {
+            gpa.free(content);
+            content = expanded;
+        }
+    }
+
+    if (s.encoding) |e| {
+        if (try attr_mod.fromUtf8(gpa, e, content)) |encoded| {
+            gpa.free(content);
+            content = encoded;
+        }
+    }
+
+    var write_buf: [8192]u8 = undefined;
+    var fw = file.writer(io, &write_buf);
+    fw.interface.writeAll(content) catch return error.IoFailed;
+    fw.end() catch return error.IoFailed;
+}
+
+fn reportUnsupportedFilter(diag: ?*?Diagnostic, gpa: Allocator, path: []const u8, driver: []const u8) void {
+    if (!core_mod.wants(diag)) return;
+    const owned_path = gpa.dupe(u8, path) catch null;
+    const detail = std.fmt.allocPrint(
+        gpa,
+        "the path names the '{s}' filter driver, which is a shell command this library cannot run",
+        .{driver},
+    ) catch null;
+    core_mod.report(diag, gpa, .{ .kind = .io, .path = owned_path, .detail = detail });
+}
+
+fn reportUnsupportedEncoding(diag: ?*?Diagnostic, gpa: Allocator, path: []const u8, name: []const u8) void {
+    if (!core_mod.wants(diag)) return;
+    const owned_path = gpa.dupe(u8, path) catch null;
+    const detail = std.fmt.allocPrint(
+        gpa,
+        "working-tree-encoding '{s}' needs a charset library this build does not have",
+        .{name},
+    ) catch null;
+    core_mod.report(diag, gpa, .{ .kind = .io, .path = owned_path, .detail = detail });
+}
+
+/// Adapts an `Odb` to the reader `ziggit-attr` takes. That module reads
+/// objects through a vtable rather than importing `ziggit-odb`, because
+/// `ziggit-odb` imports `ziggit-index` and `ziggit-index` needs the same
+/// module for the clean direction.
+fn odbReadAlloc(ctx: *anyopaque, gpa: Allocator, oid: Oid, max: usize) attr_mod.FromTreeError![]u8 {
+    const odb: *Odb = @ptrCast(@alignCast(ctx));
+    return odb.readAlloc(gpa, oid, max, null) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CorruptObject, error.CorruptPack, error.CorruptDelta => error.CorruptObject,
+        else => error.ObjectUnreadable,
+    };
+}
+
+fn odbReader(odb: *Odb) attr_mod.ObjectReader {
+    return .{ .ctx = @ptrCast(odb), .readAlloc = odbReadAlloc };
+}
+
+/// Every path in `tree_oid` whose attributes name a clean or smudge
+/// driver, without checking anything out.
+///
+/// This is the question a caller asks before a checkout: `checkoutTree`
+/// with `filters: .apply` refuses such a path with
+/// `error.UnsupportedFilter`, and this says in advance which paths would
+/// do it and which driver each names. An empty answer means a filtered
+/// checkout will not be refused for this reason.
+///
+/// `ziggit-attr` reads objects through a vtable rather than importing
+/// `ziggit-odb`, so this wraps the database the caller already holds.
+pub fn unsupportedFilters(
+    gpa: Allocator,
+    odb: *Odb,
+    tree_oid: Oid,
+) attr_mod.FromTreeError![]attr_mod.Unsupported {
+    return attr_mod.unsupportedFilters(gpa, odbReader(odb), odb.format, tree_oid);
 }

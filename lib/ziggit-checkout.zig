@@ -5,6 +5,8 @@
 
 const checkout_mod = @import("ziggit-checkout/Checkout.zig");
 pub const Strategy = checkout_mod.Strategy;
+pub const Filters = checkout_mod.Filters;
+pub const unsupportedFilters = checkout_mod.unsupportedFilters;
 pub const Error = checkout_mod.Error;
 pub const checkoutTree = checkout_mod.checkoutTree;
 

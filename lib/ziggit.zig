@@ -67,6 +67,18 @@ pub const Strategy = @import("ziggit-checkout").Strategy;
 
 pub const resolve = @import("ziggit-revwalk").resolve;
 pub const peel = @import("ziggit-revwalk").peel;
+// Content filters. `Strategy.filters` stays `.none` by default, because a
+// consumer hashes the committed bytes and a translated byte would change
+// that hash.
+pub const Filters = @import("ziggit-checkout").Filters;
+pub const AttrCoreConfig = @import("ziggit-attr").CoreConfig;
+pub const Autocrlf = @import("ziggit-attr").Autocrlf;
+pub const Eol = @import("ziggit-attr").Eol;
+pub const UnsupportedFilter = @import("ziggit-attr").Unsupported;
+// Takes the repository's own object database; `ziggit-checkout` wraps it
+// for `ziggit-attr`, which imports no database of its own.
+pub const unsupportedFilters = @import("ziggit-checkout").unsupportedFilters;
+
 pub const Walk = @import("ziggit-revwalk").Walk;
 pub const countReachable = @import("ziggit-revwalk").countReachable;
 
@@ -180,6 +192,7 @@ test {
     _ = @import("ziggit-diff");
     _ = @import("ziggit-merge");
     _ = @import("ziggit-push");
+    _ = @import("ziggit-attr");
 }
 
 // A function is not a type: `discover` being exported gives a consumer no
