@@ -218,6 +218,22 @@ pub fn build(b: *std.Build) void {
     });
     addModuleTests(b, test_step, odb);
 
+    // `.gitattributes` and the content conversion it decides: line
+    // endings, `$Id$` and encoding. It runs no clean or smudge driver,
+    // since those are shell command strings.
+    const attr = b.addModule("ziggit-attr", .{
+        .root_source_file = b.path("lib/ziggit-attr.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ziggit-oid", .module = oid },
+            .{ .name = "ziggit-core", .module = core },
+            .{ .name = "ziggit-ignore", .module = ignore },
+            .{ .name = "ziggit-object", .module = object },
+        },
+    });
+    addModuleTests(b, test_step, attr);
+
     // Writing a tree out to a working directory: content filters
     // disabled unconditionally (a caller of this project hashes the raw
     // committed blob bytes, and a filter rewriting a byte on the way out
@@ -233,6 +249,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ziggit-object", .module = object },
             .{ .name = "ziggit-odb", .module = odb },
             .{ .name = "ziggit-index", .module = index },
+            .{ .name = "ziggit-attr", .module = attr },
         },
     });
     addModuleTests(b, test_step, checkout);
@@ -240,6 +257,9 @@ pub fn build(b: *std.Build) void {
     // The index module needs the odb to stage a worktree, but odb is defined
     // after index in this file, so add this import after odb exists.
     index.addImport("ziggit-odb", odb);
+    // Declared below `index` because it needs `object`, so the import is
+    // deferred the same way `ziggit-odb`'s is.
+    index.addImport("ziggit-attr", attr);
 
     // What differs between HEAD, the index and the working tree. The two
     // porcelain columns and the untracked set, which need the index, the
@@ -446,6 +466,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-worktree", worktree);
     ziggit.addImport("ziggit-merge", merge);
     ziggit.addImport("ziggit-push", push);
+    ziggit.addImport("ziggit-attr", attr);
     addModuleTests(b, test_step, ziggit);
 
     // The plumbing CLI: the one place in this project allowed to print,
