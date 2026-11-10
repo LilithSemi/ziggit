@@ -16,6 +16,13 @@ pub const readAdvertisement = protocol_mod.readAdvertisement;
 pub const writeCommands = protocol_mod.writeCommands;
 pub const readReport = protocol_mod.readReport;
 
+const send_mod = @import("ziggit-push/send.zig");
+pub const SendError = send_mod.Error;
+pub const Update = send_mod.Update;
+pub const LeaseFailure = send_mod.LeaseFailure;
+pub const checkLeases = send_mod.checkLeases;
+pub const writeRequest = send_mod.writeRequest;
+
 const objects_mod = @import("ziggit-push/objects.zig");
 pub const ObjectsError = objects_mod.Error;
 pub const collectObjects = objects_mod.collect;
@@ -24,4 +31,5 @@ pub const OdbSource = objects_mod.OdbSource;
 test {
     _ = objects_mod;
     _ = protocol_mod;
+    _ = send_mod;
 }
