@@ -7,6 +7,7 @@
 const matcher_mod = @import("ziggit-ignore/Matcher.zig");
 pub const Matcher = matcher_mod.Matcher;
 pub const Error = matcher_mod.Error;
+pub const matchesPattern = matcher_mod.matchesPattern;
 
 test {
     _ = matcher_mod;

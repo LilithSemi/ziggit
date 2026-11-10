@@ -200,13 +200,21 @@ fn relativeTo(base: []const u8, path: []const u8) ?[]const u8 {
 }
 
 fn patternMatches(p: Pattern, relative: []const u8) bool {
-    if (p.anchored) return matchPath(p.text, relative);
-    // Unanchored patterns match a basename at any depth.
+    return matchesPattern(p.text, relative, p.anchored);
+}
+
+/// Matches one glob against one path by git's rule, exported because
+/// `.gitattributes` uses the same glob syntax as `.gitignore` and a second
+/// copy of this would drift. An anchored pattern, one holding a `/`
+/// anywhere but its end, matches the whole relative path; an unanchored one
+/// matches a basename at any depth.
+pub fn matchesPattern(pattern: []const u8, relative: []const u8, anchored: bool) bool {
+    if (anchored) return matchPath(pattern, relative);
     const basename = if (std.mem.lastIndexOfScalar(u8, relative, '/')) |i|
         relative[i + 1 ..]
     else
         relative;
-    return matchPath(p.text, basename);
+    return matchPath(pattern, basename);
 }
 
 /// Splits both sides on `/` and matches segment by segment, so `*` and `?`
