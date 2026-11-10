@@ -10,6 +10,7 @@ pub const Error = index_mod.Error;
 pub const Index = index_mod.Index;
 pub const write = index_mod.write;
 pub const stageWorktree = index_mod.stageWorktree;
+pub const StageOptions = index_mod.StageOptions;
 
 test {
     _ = index_mod;

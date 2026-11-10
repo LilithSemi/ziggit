@@ -34,6 +34,7 @@ pub const DiscoverOptions = @import("ziggit-repo").DiscoverOptions;
 // module's surface into one namespace, so the two cannot share a name.
 pub const WorktreeIndex = @import("ziggit-index").Index;
 pub const stageWorktree = @import("ziggit-index").stageWorktree;
+pub const StageOptions = @import("ziggit-index").StageOptions;
 pub const writeWorktreeIndex = @import("ziggit-index").write;
 // `WorktreeIndex.find` returns `?IndexEntry`, and its `entries` field is
 // `[]const IndexEntry`; renamed here for the same reason as
@@ -71,6 +72,11 @@ pub const peel = @import("ziggit-revwalk").peel;
 // consumer hashes the committed bytes and a translated byte would change
 // that hash.
 pub const Filters = @import("ziggit-checkout").Filters;
+// The attribute rules themselves, which `StageOptions.attributes` wants a
+// pointer to. A consumer cannot build one without naming the type, so this
+// has to arrive through `ziggit` like everything else.
+pub const Attributes = @import("ziggit-attr").Attributes;
+pub const PathAttrs = @import("ziggit-attr").PathAttrs;
 pub const AttrCoreConfig = @import("ziggit-attr").CoreConfig;
 pub const Autocrlf = @import("ziggit-attr").Autocrlf;
 pub const Eol = @import("ziggit-attr").Eol;
@@ -243,6 +249,17 @@ const SurfaceCheck = struct {
     pub fn takesDiffStatus(_: DiffStatus) void {}
     pub fn takesDiffOptions(_: DiffOptions) void {}
     pub fn takesMergeInput(_: MergeInput) void {}
+    pub fn takesStageOptions(_: StageOptions) void {}
+    pub fn takesFilters(_: Filters) void {}
+    pub fn takesAttributes(_: *Attributes) void {}
+    pub fn takesPathAttrs(_: PathAttrs) void {}
+    pub fn takesAttrCoreConfig(_: AttrCoreConfig) void {}
+    pub fn takesAutocrlf(_: Autocrlf) void {}
+    pub fn takesEol(_: Eol) void {}
+    pub fn takesUnsupportedFilter(_: UnsupportedFilter) void {}
+    pub fn takesPushUpdate(_: PushUpdate) void {}
+    pub fn takesPushReport(_: *PushReport) void {}
+    pub fn takesPushRefStatus(_: PushRefStatus) void {}
     pub fn takesMergeFileOptions(_: MergeFileOptions) void {}
     pub fn takesMergeFileResult(_: *MergeFileResult) void {}
     pub fn takesMergeOptions(_: MergeOptions) void {}
