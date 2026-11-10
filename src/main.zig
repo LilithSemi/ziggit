@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
 /// Subcommands this CLI dispatches. Checked before repository discovery so
 /// a typo is reported as an unknown subcommand, not masked by a repository
 /// error that has nothing to do with what the user typed.
-const known_commands = [_][]const u8{ "cat-file", "check-ignore", "checkout", "diff", "merge-tree", "init", "ls-tree", "ls-remote", "rev-parse", "show-ref", "status", "worktree" };
+const known_commands = [_][]const u8{ "cat-file", "check-ignore", "checkout", "diff", "merge-tree", "init", "ls-tree", "ls-remote", "push", "rev-parse", "show-ref", "status", "worktree" };
 
 fn isKnownCommand(cmd: []const u8) bool {
     for (known_commands) |k| {
@@ -74,7 +74,7 @@ fn isKnownCommand(cmd: []const u8) bool {
 
 fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     if (args.len == 0) {
-        try stderr.writeAll("usage: ziggit <cat-file|diff|ls-tree|ls-remote|rev-parse|show-ref> ...\n");
+        try stderr.writeAll("usage: ziggit <cat-file|diff|ls-tree|ls-remote|push|rev-parse|show-ref> ...\n");
         return error.UsageError;
     }
 
@@ -141,6 +141,8 @@ fn run(gpa: Allocator, io: std.Io, args: []const [:0]const u8, stdout: *std.Io.W
         try checkIgnore(gpa, io, &repo, rest, stdout, stderr);
     } else if (std.mem.eql(u8, cmd, "show-ref")) {
         try showRef(gpa, &repo, rest, stdout, stderr);
+    } else if (std.mem.eql(u8, cmd, "push")) {
+        try pushCmd(gpa, io, &repo, rest, stdout, stderr);
     } else {
         // isKnownCommand already accepted cmd above, so every name it
         // allows is handled here.
@@ -1086,5 +1088,134 @@ fn exitCodeFor(err: anyerror) u8 {
     return switch (err) {
         error.MergeConflict => 1,
         else => 128,
+    };
+}
+
+/// `ziggit push <url> <src-rev> <dst-ref> [--expect <rev>|--create]`
+///
+/// The expected old value is required rather than defaulted, because a
+/// default would be a guess about what the remote holds and that guess is
+/// the race force-with-lease exists to close. `--create` is the zero id,
+/// which says the ref must not exist yet.
+fn pushCmd(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    const usage = "usage: ziggit push <url> <src-rev> <dst-ref> (--create | --expect <rev>)\n";
+    if (args.len < 4) {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    }
+
+    const url = args[0];
+    const src_rev = args[1];
+    const dst_ref = args[2];
+
+    var expected: ?Oid = null;
+    var i: usize = 3;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--create")) {
+            expected = Oid.zero(repo.odb.format);
+        } else if (std.mem.eql(u8, args[i], "--expect")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr.writeAll(usage);
+                return error.UsageError;
+            }
+            var diag: ?Diagnostic = null;
+            expected = ziggit.resolve(gpa, repo, args[i], &diag) catch |err| {
+                try reportDiag(gpa, stderr, "could not resolve", err, &diag, args[i]);
+                return err;
+            };
+        } else {
+            try stderr.writeAll(usage);
+            return error.UsageError;
+        }
+    }
+    const expected_old = expected orelse {
+        try stderr.writeAll(usage);
+        return error.UsageError;
+    };
+
+    var new: Oid = undefined;
+    if (std.mem.eql(u8, src_rev, "--delete")) {
+        new = Oid.zero(repo.odb.format);
+    } else {
+        var diag: ?Diagnostic = null;
+        new = ziggit.resolve(gpa, repo, src_rev, &diag) catch |err| {
+            try reportDiag(gpa, stderr, "could not resolve", err, &diag, src_rev);
+            return err;
+        };
+    }
+
+    const updates = [_]ziggit.PushUpdate{.{
+        .name = dst_ref,
+        .new = new,
+        .expected_old = expected_old,
+    }};
+
+    var diag: ?Diagnostic = null;
+    var report = pushOverUrl(gpa, io, repo, url, &updates, &diag) catch |err| {
+        if (err == error.LeaseNotHeld) {
+            try stderr.print(
+                "ziggit: the remote does not hold the expected value for {s}, so nothing was sent\n",
+                .{dst_ref},
+            );
+            return err;
+        }
+        try reportDiag(gpa, stderr, "push", err, &diag, url);
+        return err;
+    };
+    defer report.deinit();
+
+    if (!report.unpacked) {
+        try stderr.print("ziggit: the remote could not store the pack: {s}\n", .{
+            report.unpack_detail orelse "no reason given",
+        });
+        return error.PushRejected;
+    }
+    for (report.refs) |s| {
+        if (s.accepted) {
+            try stdout.print("ok {s}\n", .{s.name});
+        } else {
+            try stdout.print("ng {s} {s}\n", .{ s.name, s.reason orelse "no reason given" });
+        }
+    }
+    if (!report.ok()) return error.PushRejected;
+}
+
+/// Opens the transport `url` names and pushes over it. `ssh://` is
+/// refused for the same reason `ls-remote` refuses it: this CLI has no
+/// host key policy of its own, and inventing one here would mean
+/// silently trusting or silently refusing every host key alike.
+fn pushOverUrl(
+    gpa: Allocator,
+    io: std.Io,
+    repo: *Repository,
+    url: []const u8,
+    updates: []const ziggit.PushUpdate,
+    diag: *?Diagnostic,
+) !ziggit.PushReport {
+    return switch (ziggit.classifyUrl(url)) {
+        .http, .https => blk: {
+            var http = try ziggit.Http.open(gpa, io, url, .{ .service = .receive_pack });
+            defer http.deinit();
+            break :blk ziggit.push(gpa, &repo.odb, repo.odb.format, http.transport(), updates, diag);
+        },
+        .git_daemon => blk: {
+            var daemon = try ziggit.Git.open(gpa, io, url, .receive_pack);
+            defer daemon.deinit();
+            break :blk ziggit.push(gpa, &repo.odb, repo.odb.format, daemon.transport(), updates, diag);
+        },
+        .ssh => error.SshVerifierRequired,
+        // A push to a path on this filesystem would need receive-pack's
+        // work done locally rather than a protocol, which is a different
+        // piece of work from this one.
+        .local => error.UnsupportedProtocol,
+        .unknown => error.UnsupportedProtocol,
     };
 }
