@@ -507,7 +507,7 @@ fn remoteRefs(gpa: Allocator, io: std.Io, url: []const u8, diag: *?Diagnostic) !
         // alike.
         .ssh => error.SshVerifierRequired,
         .git_daemon => blk: {
-            var daemon = try ziggit.Git.open(gpa, io, url);
+            var daemon = try ziggit.Git.open(gpa, io, url, .upload_pack);
             defer daemon.deinit();
             break :blk transportRefs(gpa, daemon.transport(), diag);
         },

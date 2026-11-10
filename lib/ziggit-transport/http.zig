@@ -23,6 +23,7 @@ const Options = transport_mod.Options;
 const Command = transport_mod.Command;
 const Progress = transport_mod.Progress;
 const Capabilities = transport_mod.Capabilities;
+const Service = transport_mod.Service;
 const Diagnostic = transport_mod.Diagnostic;
 const Error = transport_mod.Error;
 
@@ -103,6 +104,7 @@ pub const Http = struct {
     const vtable: Transport.VTable = .{
         .capabilities = capabilitiesImpl,
         .command = commandImpl,
+        .advertiseRefs = advertiseRefsImpl,
         .close = closeImpl,
     };
 
@@ -183,10 +185,16 @@ fn capabilitiesImpl(ctx: *anyopaque, gpa: Allocator, diag: ?*?Diagnostic) Error!
 
 fn commandImpl(ctx: *anyopaque, gpa: Allocator, cmd: Command, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {
     const h: *Http = @ptrCast(@alignCast(ctx));
+    const service = h.options.service;
 
-    const url = std.fmt.allocPrint(gpa, "{s}/git-upload-pack", .{h.base_url}) catch
+    const url = std.fmt.allocPrint(gpa, "{s}/{s}", .{ h.base_url, service.wireName() }) catch
         return error.OutOfMemory;
     defer gpa.free(url);
+
+    const content_type = switch (service) {
+        .upload_pack => "application/x-git-upload-pack-request",
+        .receive_pack => "application/x-git-receive-pack-request",
+    };
 
     var body_ctx: BodyCtx = .{ .data = cmd.body, .pos = 0 };
     const body: zurl.Transfer.Body = .{
@@ -194,14 +202,48 @@ fn commandImpl(ctx: *anyopaque, gpa: Allocator, cmd: Command, out: **std.Io.Read
         .ctx = &body_ctx,
         .read = bodyRead,
         .rewind = bodyRewind,
-        .content_type = "application/x-git-upload-pack-request",
+        .content_type = content_type,
     };
 
-    const zopts = h.zurlOptions(.POST, body, &.{
-        .{ .name = "Git-Protocol", .value = "version=2" },
-    });
+    const v2_header = [_]std.http.Header{.{ .name = "Git-Protocol", .value = "version=2" }};
+    const headers: []const std.http.Header = switch (service) {
+        .upload_pack => &v2_header,
+        .receive_pack => &.{},
+    };
+
+    const zopts = h.zurlOptions(.POST, body, headers);
 
     const resp = try performWithAuth(gpa, h, url, zopts, &body_ctx, diag);
+    out.* = resp.body;
+}
+
+fn advertiseRefsImpl(
+    ctx: *anyopaque,
+    gpa: Allocator,
+    out: **std.Io.Reader,
+    diag: ?*?Diagnostic,
+) Error!void {
+    const h: *Http = @ptrCast(@alignCast(ctx));
+    const service = h.options.service;
+
+    const url = std.fmt.allocPrint(gpa, "{s}/info/refs?service={s}", .{
+        h.base_url,
+        service.wireName(),
+    }) catch return error.OutOfMemory;
+    defer gpa.free(url);
+
+    const v2_header = [_]std.http.Header{.{ .name = "Git-Protocol", .value = "version=2" }};
+    const headers: []const std.http.Header = switch (service) {
+        .upload_pack => &v2_header,
+        .receive_pack => &.{},
+    };
+
+    const resp = try performWithAuth(gpa, h, url, h.zurlOptions(.GET, null, headers), null, diag);
+
+    // The advertisement proper starts after the `# service=` line and its
+    // flush, so a caller parses refs without knowing this is HTTP.
+    var buf: [pktline_mod.Packet.max_data_length]u8 = undefined;
+    try skipServiceHeader(gpa, resp.body, &buf, service.wireName(), diag);
     out.* = resp.body;
 }
 

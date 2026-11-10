@@ -58,6 +58,7 @@ const Transport = transport_mod.Transport;
 const Options = transport_mod.Options;
 const Command = transport_mod.Command;
 const Capabilities = transport_mod.Capabilities;
+const Service = transport_mod.Service;
 const Diagnostic = transport_mod.Diagnostic;
 const Error = transport_mod.Error;
 
@@ -281,12 +282,16 @@ pub const Ssh = struct {
             return error.OutOfMemory;
         defer gpa.free(env_buf);
         // A refusal here is not fatal: see this file's own doc comment.
-        state.client.channel.requestEnv(env_buf, git_protocol_name, git_protocol_value) catch |err| switch (err) {
-            error.ChannelRequestRefused => {},
-            else => return mapChannelError(err),
-        };
+        // Receive-pack has no v2 form, so asking for it would be asking
+        // the remote for a protocol it cannot speak on this service.
+        if (options.service == .upload_pack) {
+            state.client.channel.requestEnv(env_buf, git_protocol_name, git_protocol_value) catch |err| switch (err) {
+                error.ChannelRequestRefused => {},
+                else => return mapChannelError(err),
+            };
+        }
 
-        const command_text = try buildExecCommand(parsed.path);
+        const command_text = try buildExecCommand(options.service, parsed.path);
         const exec_buf = gpa.alloc(u8, command_text.len() + zurl_ssh.connection.max_control_bytes) catch
             return error.OutOfMemory;
         defer gpa.free(exec_buf);
@@ -320,8 +325,21 @@ pub const Ssh = struct {
     const vtable: Transport.VTable = .{
         .capabilities = capabilitiesImpl,
         .command = commandImpl,
+        .advertiseRefs = advertiseRefsImpl,
         .close = closeImpl,
     };
+
+    /// The v1 advertisement is already on the channel: the remote sends it
+    /// as soon as `open` runs its command. This only rewinds the reader to
+    /// the start of it.
+    fn advertiseRefsImpl(ctx: *anyopaque, gpa: Allocator, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {
+        _ = gpa;
+        const s: *Ssh = @ptrCast(@alignCast(ctx));
+        s.state.pending_diag = diag;
+        s.state.reader.interface.seek = 0;
+        s.state.reader.interface.end = 0;
+        out.* = &s.state.reader.interface;
+    }
 
     fn capabilitiesImpl(ctx: *anyopaque, gpa: Allocator, diag: ?*?Diagnostic) Error!Capabilities {
         const s: *Ssh = @ptrCast(@alignCast(ctx));
@@ -511,11 +529,16 @@ fn parseScpUrl(url: []const u8) Error!ParsedUrl {
     return .{ .user = user, .host = host, .port = zurl_ssh.Client.default_port, .path = path };
 }
 
-/// `"git-upload-pack "` followed by `path` quoted with `zurl_scp.command`'s
-/// rule. Its module header states that rule once; nothing here writes a
-/// second one.
+/// The service name, a space, then `path` quoted with
+/// `zurl_scp.command`'s rule. Its module header states that rule once;
+/// nothing here writes a second one.
+const max_service_name = @max(
+    Service.upload_pack.wireName().len,
+    Service.receive_pack.wireName().len,
+);
+
 const ExecCommand = struct {
-    storage: [exec_prefix.len + 2 + zurl_scp.command.max_path_bytes * zurl_scp.command.quote_growth]u8,
+    storage: [max_service_name + 2 + zurl_scp.command.max_path_bytes * zurl_scp.command.quote_growth]u8,
     text_len: usize,
 
     fn slice(c: *const ExecCommand) []const u8 {
@@ -527,24 +550,25 @@ const ExecCommand = struct {
     }
 };
 
-const exec_prefix = "git-upload-pack ";
-
 /// The `env` request name and value git sends to ask for wire protocol
 /// v2 over SSH. See this file's module doc comment for why a refusal of
 /// this request is expected and not an error.
 const git_protocol_name = "GIT_PROTOCOL";
 const git_protocol_value = "version=2";
 
-fn buildExecCommand(path: []const u8) Error!ExecCommand {
+fn buildExecCommand(service: Service, path: []const u8) Error!ExecCommand {
+    const exec_prefix = service.wireName();
     // Checked before any quoting runs, so a path far past what this
     // build ever sends cannot make `quote` walk megabytes of input first.
     if (path.len == 0 or path.len > zurl_scp.command.max_path_bytes) return error.ProtocolError;
 
     var out: ExecCommand = .{ .storage = undefined, .text_len = 0 };
     @memcpy(out.storage[0..exec_prefix.len], exec_prefix);
-    const quoted = zurl_scp.command.quote(out.storage[exec_prefix.len..], path) catch
+    out.storage[exec_prefix.len] = ' ';
+    const head = exec_prefix.len + 1;
+    const quoted = zurl_scp.command.quote(out.storage[head..], path) catch
         return error.ProtocolError;
-    out.text_len = exec_prefix.len + quoted.len;
+    out.text_len = head + quoted.len;
     return out;
 }
 

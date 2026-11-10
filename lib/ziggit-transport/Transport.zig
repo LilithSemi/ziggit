@@ -41,6 +41,11 @@ pub const Progress = struct {
 /// global: a caller that runs two fetches at once, against two hosts,
 /// gives each its own `Options` and never reaches for a shared one.
 pub const Options = struct {
+    /// Which remote service this transport talks to. It picks the url, the
+    /// daemon request line or the ssh command, so it is fixed when the
+    /// transport opens rather than per call: ssh runs one remote process
+    /// for the life of its channel.
+    service: Service = .upload_pack,
     credentials: ?CredentialCallback = null,
     credentials_ctx: ?*anyopaque = null,
     progress: ?Progress = null,
@@ -53,6 +58,24 @@ pub const Options = struct {
     stall_timeout_s: u32 = 300,
     proxy_url: ?[]const u8 = null,
     follow_redirects: u8 = 10,
+};
+
+/// Which git service a transport talks to. Fetch uses `upload_pack` and
+/// protocol v2. Push uses `receive_pack`, which has no v2 at all, so a
+/// caller asking for it reads a v1 ref advertisement and must not send
+/// the v2 protocol header.
+pub const Service = enum {
+    upload_pack,
+    receive_pack,
+
+    /// The name git puts on the wire, in a url, a daemon request line or
+    /// an ssh exec command.
+    pub fn wireName(s: Service) []const u8 {
+        return switch (s) {
+            .upload_pack => "git-upload-pack",
+            .receive_pack => "git-receive-pack",
+        };
+    }
 };
 
 /// One v2 command: its name, for the implementation's own bookkeeping,
@@ -78,6 +101,12 @@ pub const Transport = struct {
         /// making that next call; the implementation is free to reuse or
         /// free the memory behind it once that call starts.
         command: *const fn (ctx: *anyopaque, gpa: Allocator, cmd: Command, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void,
+        /// The v1 ref advertisement, for a service with no v2 form. The
+        /// reader is positioned at the first advertisement pkt-line, with
+        /// any transport specific prefix already consumed, and is
+        /// invalidated by the next call on the same `Transport` exactly as
+        /// `command`'s is.
+        advertiseRefs: *const fn (ctx: *anyopaque, gpa: Allocator, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void,
         close: *const fn (ctx: *anyopaque) void,
     };
 
@@ -89,6 +118,11 @@ pub const Transport = struct {
     /// invalidated by the next `capabilities` or `command` call on `t`.
     pub fn command(t: Transport, gpa: Allocator, cmd: Command, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {
         return t.vtable.command(t.ptr, gpa, cmd, out, diag);
+    }
+
+    /// See `VTable.advertiseRefs`.
+    pub fn advertiseRefs(t: Transport, gpa: Allocator, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {
+        return t.vtable.advertiseRefs(t.ptr, gpa, out, diag);
     }
 
     pub fn close(t: Transport) void {

@@ -964,8 +964,25 @@ const FakeTransport = struct {
     const vtable: Transport.VTable = .{
         .capabilities = capabilitiesImpl,
         .command = commandImpl,
+        .advertiseRefs = advertiseRefsImpl,
         .close = closeImpl,
     };
+
+    /// This mock speaks v2 upload-pack alone. A fetch never reaches the
+    /// v1 advertisement, so reaching it here is a wiring fault worth
+    /// failing on rather than answering with empty bytes.
+    fn advertiseRefsImpl(
+        ctx: *anyopaque,
+        gpa: Allocator,
+        out: **std.Io.Reader,
+        diag: ?*?Diagnostic,
+    ) transport_mod.Error!void {
+        _ = ctx;
+        _ = gpa;
+        _ = out;
+        _ = diag;
+        return error.ProtocolError;
+    }
 
     fn capabilitiesImpl(ctx: *anyopaque, gpa: Allocator, diag: ?*?Diagnostic) transport_mod.Error!proto.Capabilities {
         _ = diag;

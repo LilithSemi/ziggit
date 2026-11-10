@@ -30,6 +30,7 @@ const transport_mod = @import("Transport.zig");
 const Transport = transport_mod.Transport;
 const Command = transport_mod.Command;
 const Capabilities = transport_mod.Capabilities;
+const Service = transport_mod.Service;
 const Diagnostic = transport_mod.Diagnostic;
 const Error = transport_mod.Error;
 
@@ -63,17 +64,19 @@ pub const Git = struct {
     state: *State,
 
     /// Connects to the daemon at `url` (`git://host[:port]/path`) and asks
-    /// it for `git-upload-pack` on that path.
+    /// it for `service` on that path.
     ///
-    /// **This takes no `Options`, unlike `Http.open` and `Ssh.open`.** Not
-    /// one field of it can be honoured here today: credentials have nothing
+    /// **This takes a `Service` rather than an `Options`, unlike
+    /// `Http.open` and `Ssh.open`.** The service is the one setting this
+    /// transport can act on, so it is the one it accepts. Of the rest, not
+    /// one field can be honoured here today: credentials have nothing
     /// to authenticate to, the proxy, CA and redirect settings are HTTP's
     /// alone, and the connect timeout is refused by `std.Io` itself (see
     /// below). Taking the struct and ignoring it would be an option a
     /// caller can set and this code silently drops, which is a bug this
     /// project has shipped more than once. The parameter comes back when
     /// there is something for it to control.
-    pub fn open(gpa: Allocator, io: std.Io, url: []const u8) Error!Git {
+    pub fn open(gpa: Allocator, io: std.Io, url: []const u8, service: Service) Error!Git {
         const parsed = try parseUrl(url);
 
         const address = std.Io.net.IpAddress.resolve(io, parsed.host, parsed.port) catch
@@ -107,7 +110,7 @@ pub const Git = struct {
         }) catch return error.NetworkFailed;
         errdefer state.stream.close(io);
 
-        try writeRequest(io, &state.stream, parsed);
+        try writeRequest(io, &state.stream, service, parsed);
 
         state.reader = state.stream.reader(io, &state.reader_buffer);
         state.writer = state.stream.writer(io, &state.writer_buffer);
@@ -127,8 +130,20 @@ pub const Git = struct {
     const vtable: Transport.VTable = .{
         .capabilities = capabilitiesImpl,
         .command = commandImpl,
+        .advertiseRefs = advertiseRefsImpl,
         .close = closeImpl,
     };
+
+    /// The daemon sends the v1 advertisement as soon as it has read the
+    /// request line, so this only rewinds the reader to the start of it.
+    fn advertiseRefsImpl(ctx: *anyopaque, gpa: Allocator, out: **std.Io.Reader, diag: ?*?Diagnostic) Error!void {
+        _ = gpa;
+        _ = diag;
+        const g: *Git = @ptrCast(@alignCast(ctx));
+        g.state.reader.interface.seek = 0;
+        g.state.reader.interface.end = 0;
+        out.* = &g.state.reader.interface;
+    }
 
     fn capabilitiesImpl(ctx: *anyopaque, gpa: Allocator, diag: ?*?Diagnostic) Error!Capabilities {
         const g: *Git = @ptrCast(@alignCast(ctx));
@@ -255,11 +270,12 @@ const max_request_len: usize = 4096;
 /// **The port appears in `host=` only when the url wrote one.** The second
 /// line above is the same daemon on port 9418 reached by a url that named
 /// no port.
-fn buildRequest(buf: *[max_request_len]u8, parsed: ParsedUrl) Error![]const u8 {
+fn buildRequest(buf: *[max_request_len]u8, service: Service, parsed: ParsedUrl) Error![]const u8 {
     // The length prefix covers itself, so the payload is written after
     // room for it, measured, and the prefix filled in over the front.
     var payload: std.Io.Writer = .fixed(buf[4..]);
-    payload.writeAll("git-upload-pack ") catch return error.ProtocolError;
+    payload.writeAll(service.wireName()) catch return error.ProtocolError;
+    payload.writeByte(' ') catch return error.ProtocolError;
     payload.writeAll(parsed.path) catch return error.ProtocolError;
     payload.writeByte(0) catch return error.ProtocolError;
     payload.writeAll("host=") catch return error.ProtocolError;
@@ -268,10 +284,16 @@ fn buildRequest(buf: *[max_request_len]u8, parsed: ParsedUrl) Error![]const u8 {
         payload.print(":{d}", .{parsed.port}) catch return error.ProtocolError;
     }
     payload.writeByte(0) catch return error.ProtocolError;
-    // The empty field that introduces the extra parameters.
-    payload.writeByte(0) catch return error.ProtocolError;
-    payload.writeAll("version=2") catch return error.ProtocolError;
-    payload.writeByte(0) catch return error.ProtocolError;
+    // Receive-pack has one advertisement format and no v2, so it is sent
+    // no version at all: an absent version cannot change its reply, while
+    // naming a version it does not have could. Upload-pack needs the
+    // version to answer v2 rather than v0.
+    if (service == .upload_pack) {
+        // The empty field that introduces the extra parameters.
+        payload.writeByte(0) catch return error.ProtocolError;
+        payload.writeAll("version=2") catch return error.ProtocolError;
+        payload.writeByte(0) catch return error.ProtocolError;
+    }
 
     const total = payload.buffered().len + 4;
     if (total > 0xffff) return error.ProtocolError;
@@ -280,9 +302,9 @@ fn buildRequest(buf: *[max_request_len]u8, parsed: ParsedUrl) Error![]const u8 {
     return buf[0..total];
 }
 
-fn writeRequest(io: std.Io, stream: *std.Io.net.Stream, parsed: ParsedUrl) Error!void {
+fn writeRequest(io: std.Io, stream: *std.Io.net.Stream, service: Service, parsed: ParsedUrl) Error!void {
     var buf: [max_request_len]u8 = undefined;
-    const line = try buildRequest(&buf, parsed);
+    const line = try buildRequest(&buf, service, parsed);
     var out_buf: [max_request_len]u8 = undefined;
     var out = stream.writer(io, &out_buf);
     out.interface.writeAll(line) catch return error.NetworkFailed;
@@ -302,7 +324,7 @@ test "the daemon request line matches the bytes git sends" {
     // written from a specification.
     var parsed = try parseUrl("git://127.0.0.1:9501/project.git");
     var buf: [max_request_len]u8 = undefined;
-    var got = try buildRequest(&buf, parsed);
+    var got = try buildRequest(&buf, .upload_pack, parsed);
     try testing.expectEqualStrings(
         "0040git-upload-pack /project.git\x00host=127.0.0.1:9501\x00\x00version=2\x00",
         got,
@@ -311,7 +333,7 @@ test "the daemon request line matches the bytes git sends" {
     // The same daemon reached by a url naming no port: git omits the port
     // from `host=` entirely, and the length changes with it.
     parsed = try parseUrl("git://127.0.0.1/project.git");
-    got = try buildRequest(&buf, parsed);
+    got = try buildRequest(&buf, .upload_pack, parsed);
     try testing.expectEqualStrings(
         "003bgit-upload-pack /project.git\x00host=127.0.0.1\x00\x00version=2\x00",
         got,
@@ -344,4 +366,19 @@ test "a git url this transport cannot serve is refused by name" {
     try testing.expectError(error.ProtocolError, parseUrl("git://example.com"));
     try testing.expectError(error.ProtocolError, parseUrl("git://example.com/"));
     try testing.expectError(error.ProtocolError, parseUrl("git:///a.git"));
+}
+
+test "a receive-pack request line names the service and sends no version" {
+    // Not captured from git: starting a listening daemon was not available
+    // here. Receive-pack has one advertisement format and no v2, so an
+    // absent version cannot change the daemon's reply, while naming a
+    // version the service does not have could. This pins the bytes this
+    // build sends so a later capture has something exact to disagree with.
+    const parsed = try parseUrl("git://127.0.0.1:9501/project.git");
+    var buf: [max_request_len]u8 = undefined;
+    const got = try buildRequest(&buf, .receive_pack, parsed);
+    try testing.expectEqualStrings(
+        "0036git-receive-pack /project.git\x00host=127.0.0.1:9501\x00",
+        got,
+    );
 }

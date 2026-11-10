@@ -161,7 +161,7 @@ pub fn fetch(
             break :blk fetcher_mod.fetchRemote(gpa, io, repo, ssh.transport(), opts, diag);
         },
         .git_daemon => blk: {
-            var daemon = try Git.open(gpa, io, url);
+            var daemon = try Git.open(gpa, io, url, .upload_pack);
             defer daemon.deinit();
             var opts = options;
             opts.remote_url = url;
