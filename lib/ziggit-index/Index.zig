@@ -19,6 +19,7 @@ const FileMode = core_mod.FileMode;
 
 const odb_mod = @import("ziggit-odb");
 const ignore_mod = @import("ziggit-ignore");
+const attr_mod = @import("ziggit-attr");
 const Odb = odb_mod.Odb;
 
 /// Which side of a conflict an entry belongs to. `merged` is the normal,
@@ -84,7 +85,15 @@ pub const Entry = struct {
     }
 };
 
-pub const Error = error{ IndexNotFound, IoFailed, CorruptIndex, UnsupportedIndexVersion } || Allocator.Error || Odb.Error;
+pub const Error = error{
+    IndexNotFound,
+    IoFailed,
+    CorruptIndex,
+    UnsupportedIndexVersion,
+    /// `stageWorktree` with attributes given met a path naming a `filter=`
+    /// clean driver, which is a shell command this library cannot run.
+    UnsupportedFilter,
+} || Allocator.Error || Odb.Error || attr_mod.EncodingError;
 
 /// A reader fails when trying to read bytes. Running out of bytes means the
 /// file is short, which for a format carrying its own lengths is corruption.
@@ -1004,6 +1013,24 @@ pub const StageOptions = struct {
     /// the global excludes file and `.git/info/exclude`, in that order.
     /// This adds only the `.gitignore` files it meets in the tree.
     ignore: ?*ignore_mod.Matcher = null,
+    /// Attribute rules for the clean direction, or null to store every
+    /// file exactly as it sits on disk. Null is the default, for the same
+    /// reason `Checkout.Strategy.filters` defaults to `.none`: a consumer
+    /// hashes the committed bytes and a translated byte changes that hash.
+    ///
+    /// With rules given, a worktree file whose path counts as text has its
+    /// CRLF collapsed to LF before it is hashed, which is what makes a
+    /// blob this stages match the one git would store. A path naming a
+    /// `filter=` driver is refused rather than stored unfiltered.
+    ///
+    /// **The walk mutates this and restores it**, the same way it treats
+    /// `ignore`: it adds each directory's own `.gitattributes` on the way
+    /// in and drops it on the way out. A caller supplies whatever
+    /// higher-precedence source it wants first, which in git's order is
+    /// `$GIT_DIR/info/attributes` through `addInfoText`.
+    attributes: ?*attr_mod.Attributes = null,
+    /// `core.autocrlf` and `core.eol`, read only when `attributes` is set.
+    core: attr_mod.CoreConfig = .{},
 };
 
 pub fn stageWorktree(gpa: Allocator, io: std.Io, work_tree: std.Io.Dir, odb: *Odb, f: Format, options: StageOptions) Error!Index {
@@ -1051,6 +1078,17 @@ fn walkDirectory(
         };
     }
     defer if (options.ignore) |m| m.truncate(restore_to);
+
+    // The same dance for this directory's own `.gitattributes`, which
+    // outranks every one above it and is dropped again on the way out.
+    var attr_restore_to: usize = 0;
+    if (options.attributes) |a| {
+        attr_restore_to = a.sourceCount();
+        const base = path_buf[0..path_len];
+        const trimmed = if (base.len > 0 and base[base.len - 1] == '/') base[0 .. base.len - 1] else base;
+        try a.addFile(io, current, ".gitattributes", trimmed);
+    }
+    defer if (options.attributes) |a| a.truncate(attr_restore_to);
 
     var iterator = current.iterate();
 
@@ -1106,7 +1144,9 @@ fn walkDirectory(
                 };
                 defer gpa.free(content);
 
-                const oid = try odb.write(.blob, content, null);
+                const staged = try cleanForStaging(gpa, path_buf[0..current_path_len], content, options);
+                defer if (staged.owned) gpa.free(@constCast(staged.bytes));
+                const oid = try odb.write(.blob, staged.bytes, null);
 
                 // Determine file mode based on permissions
                 const mode: FileMode = if (@backingInt(stat.permissions) & 0o111 != 0)
@@ -1587,4 +1627,58 @@ test "a nested gitignore applies inside its own directory and nowhere else" {
     try std.testing.expect(index.find("other/hide.txt") != null);
     // The matcher is left exactly as it arrived.
     try std.testing.expectEqual(before, m.sourceCount());
+}
+
+/// A worktree file's bytes after the clean direction, and whether they are
+/// a fresh allocation the caller has to free.
+const Cleaned = struct {
+    bytes: []const u8,
+    owned: bool,
+};
+
+/// Runs the clean direction over one worktree file.
+///
+/// The order is git's: the encoding conversion happens on the worktree
+/// side, so decoding to UTF-8 comes first, then line endings and `$Id$`
+/// act on the UTF-8 a blob holds.
+fn cleanForStaging(
+    gpa: Allocator,
+    path: []const u8,
+    content: []const u8,
+    options: StageOptions,
+) Error!Cleaned {
+    const attrs: *const attr_mod.Attributes = options.attributes orelse
+        return .{ .bytes = content, .owned = false };
+    const plan = attr_mod.plan(attrs.lookup(path), options.core);
+    if (plan.filter != null) return error.UnsupportedFilter;
+
+    var current = content;
+    var owned = false;
+    errdefer if (owned) gpa.free(@constCast(current));
+
+    if (plan.encoding) |name| {
+        const e = attr_mod.Encoding.parse(name) orelse return error.UnsupportedEncoding;
+        if (try attr_mod.toUtf8(gpa, e, current)) |decoded| {
+            current = decoded;
+            owned = true;
+        }
+    }
+
+    if (attr_mod.cleanTranslates(plan.kind, current)) {
+        if (try attr_mod.cleanLineEndings(gpa, current)) |converted| {
+            if (owned) gpa.free(@constCast(current));
+            current = converted;
+            owned = true;
+        }
+    }
+
+    if (plan.ident) {
+        if (try attr_mod.cleanIdent(gpa, current)) |collapsed| {
+            if (owned) gpa.free(@constCast(current));
+            current = collapsed;
+            owned = true;
+        }
+    }
+
+    return .{ .bytes = current, .owned = owned };
 }
