@@ -82,6 +82,15 @@ pub const RefOutcome = @import("ziggit-fetch").RefOutcome;
 // transports. Exported so a consumer, and this project's own CLI, pick a
 // transport by the same rule `fetch` uses rather than by a second copy of
 // it that drifts out of date.
+// Pushing. `Update.expected_old` is the whole of force-with-lease: the
+// remote compares it before it moves a ref, and `push` compares it
+// against the advertisement first so a lost race costs no upload.
+pub const push = @import("ziggit-push").push;
+pub const PushUpdate = @import("ziggit-push").Update;
+pub const PushReport = @import("ziggit-push").Report;
+pub const PushRefStatus = @import("ziggit-push").RefStatus;
+pub const PushError = @import("ziggit-push").PushError;
+
 pub const UrlKind = @import("ziggit-fetch").UrlKind;
 pub const classifyUrl = @import("ziggit-fetch").classifyUrl;
 
@@ -170,6 +179,7 @@ test {
     _ = @import("ziggit-submodule");
     _ = @import("ziggit-diff");
     _ = @import("ziggit-merge");
+    _ = @import("ziggit-push");
 }
 
 // A function is not a type: `discover` being exported gives a consumer no

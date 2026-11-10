@@ -16,6 +16,10 @@ pub const readAdvertisement = protocol_mod.readAdvertisement;
 pub const writeCommands = protocol_mod.writeCommands;
 pub const readReport = protocol_mod.readReport;
 
+const pusher_mod = @import("ziggit-push/Pusher.zig");
+pub const PushError = pusher_mod.Error;
+pub const push = pusher_mod.push;
+
 const send_mod = @import("ziggit-push/send.zig");
 pub const SendError = send_mod.Error;
 pub const Update = send_mod.Update;
@@ -32,4 +36,5 @@ test {
     _ = objects_mod;
     _ = protocol_mod;
     _ = send_mod;
+    _ = pusher_mod;
 }

@@ -445,6 +445,7 @@ pub fn build(b: *std.Build) void {
     ziggit.addImport("ziggit-diff", diff);
     ziggit.addImport("ziggit-worktree", worktree);
     ziggit.addImport("ziggit-merge", merge);
+    ziggit.addImport("ziggit-push", push);
     addModuleTests(b, test_step, ziggit);
 
     // The plumbing CLI: the one place in this project allowed to print,
