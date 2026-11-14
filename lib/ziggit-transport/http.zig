@@ -250,6 +250,12 @@ fn advertiseRefsImpl(
 /// Reads the `# service=<service>` pkt-line and the flush behind it, the
 /// prefix git's smart HTTP `GET .../info/refs` puts in front of the
 /// ordinary capability advertisement.
+///
+/// The prefix is optional. Protocol v2 opens with `version 2` instead, and
+/// git reads a response that starts either way, so a stream without the
+/// prefix is left where it is for the caller to parse. Forgejo sends the
+/// prefix even for v2, which is why this went unseen: requiring it worked
+/// against our own forge and failed against plain `git-http-backend`.
 fn skipServiceHeader(
     gpa: Allocator,
     r: *std.Io.Reader,
@@ -257,6 +263,16 @@ fn skipServiceHeader(
     service: []const u8,
     diag: ?*?Diagnostic,
 ) Error!void {
+    const prefix = "# service=";
+    const opening = r.peek(pktline_mod.Packet.header_len + prefix.len) catch |err| switch (err) {
+        error.EndOfStream => return,
+        error.ReadFailed => {
+            recordMessage(gpa, diag, "the server's info/refs response could not be read");
+            return error.ProtocolError;
+        },
+    };
+    if (!std.mem.eql(u8, opening[pktline_mod.Packet.header_len..], prefix)) return;
+
     const packet = pktline_mod.read(r, buf) catch {
         recordMessage(gpa, diag, "the server's info/refs response is not a pkt-line stream");
         return error.ProtocolError;
@@ -891,6 +907,25 @@ test "a server that advertises only version 1 is UnsupportedProtocol" {
 
     const result = h.transport().capabilities(gpa, null);
     try testing.expectError(error.UnsupportedProtocol, result);
+}
+
+test "a v2 advertisement with no service line is read, as git reads it" {
+    const gpa = testing.allocator;
+    // What `git-http-backend` answers a `Git-Protocol: version=2` request:
+    // the capability list, with no "# service=" line in front of it.
+    const bare_body = "000eversion 2\x0a001bagent=git/2.56.0-Linux\x0a0013ls-refs=unborn\x0a" ++
+        "0020fetch=shallow wait-for-done\x0a0012server-option\x0a0017object-format=sha1\x0a0000";
+    var server: TestServer = undefined;
+    try server.start(&.{okResponse(bare_body)});
+    defer server.stop();
+
+    var h = try testHttp(gpa, server.port(), .{});
+    defer h.deinit();
+
+    var caps = try h.transport().capabilities(gpa, null);
+    defer caps.deinit(gpa);
+
+    try testing.expect(caps.isV2());
 }
 
 test "the response body is streamed, not buffered" {
